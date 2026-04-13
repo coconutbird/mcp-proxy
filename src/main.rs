@@ -8,9 +8,11 @@ mod generate;
 mod server;
 mod transport;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use anyhow::Result;
 use clap::Parser;
-use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -44,13 +46,13 @@ async fn main() -> Result<()> {
         cli::Cmd::Generate { target, dir } => {
             cmd_generate(&args.config, profile.as_deref(), &target, &dir)
         }
+        cli::Cmd::Server { action } => cmd_server(&args.config, action),
+        cli::Cmd::Profile { action } => cmd_profile(&args.config, action),
         cli::Cmd::Clients { port } => cmd_clients(port, profile.as_deref()),
         cli::Cmd::Status => cmd_status(),
         cli::Cmd::Sync { port } => cmd_sync(port, profile.as_deref()),
         cli::Cmd::Uninstall => cmd_uninstall(),
         cli::Cmd::Health { port } => cmd_health(port).await,
-        cli::Cmd::Profiles => cmd_profiles(&args.config),
-        cli::Cmd::Switch { profile: p } => cmd_switch(&args.config, p.as_deref()),
         cli::Cmd::Init => cmd_init(&args.config),
     }
 }
@@ -208,61 +210,281 @@ async fn cmd_health(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn cmd_profiles(config_path: &std::path::Path) -> Result<()> {
-    let cfg = config::load(config_path)?;
-    let active = config::read_active_profile();
-    let profiles = config::list_profiles(&cfg);
+// ---------------------------------------------------------------------------
+// Server management
+// ---------------------------------------------------------------------------
 
-    if profiles.is_empty() {
-        eprintln!("no profiles defined in {}", config_path.display());
-        eprintln!("\nadd a \"profiles\" section to your config, e.g.:");
-        eprintln!("  \"profiles\": {{");
-        eprintln!("    \"work\": {{ \"include\": [\"github\", \"memory\"] }},");
-        eprintln!("    \"home\": {{ \"exclude\": [\"github\"] }}");
-        eprintln!("  }}");
-        return Ok(());
-    }
+fn cmd_server(config_path: &std::path::Path, action: cli::ServerCmd) -> Result<()> {
+    use cli::ServerCmd;
 
-    eprintln!("\n📋 Available profiles:\n");
-    for (name, desc) in &profiles {
-        let marker = if active.as_deref() == Some(*name) {
-            " ◀ active"
-        } else {
-            ""
-        };
-        let description = desc.unwrap_or("(no description)");
-        eprintln!("  {name:<16} {description}{marker}");
-    }
+    match action {
+        ServerCmd::List => {
+            let cfg = config::load(config_path)?;
+            if cfg.servers.is_empty() {
+                eprintln!("no servers configured");
+                return Ok(());
+            }
+            for (name, srv) in &cfg.servers {
+                let install_info = match &srv.install {
+                    Some(config::InstallConfig::Npm { package }) => {
+                        format!(" (npm: {package})")
+                    }
+                    Some(config::InstallConfig::Pip { package }) => {
+                        format!(" (pip: {package})")
+                    }
+                    Some(config::InstallConfig::Binary { binary, .. }) => {
+                        format!(" (binary: {binary})")
+                    }
+                    Some(config::InstallConfig::Npx) => " (npx)".to_string(),
+                    None => String::new(),
+                };
+                let rt = if srv.install.is_some() {
+                    match srv.runtime {
+                        config::Runtime::Docker => " [docker]",
+                        config::Runtime::Local => " [local]",
+                    }
+                } else {
+                    ""
+                };
+                eprintln!("  {name:<20} {}{install_info}{rt}", srv.command);
+            }
+            Ok(())
+        }
+        ServerCmd::Add {
+            name,
+            command,
+            args,
+            env,
+            npm,
+            pip,
+            runtime,
+        } => {
+            let mut cfg = config::load(config_path)?;
+            if cfg.servers.contains_key(&name) {
+                anyhow::bail!("server '{name}' already exists — use `server edit` to modify it");
+            }
 
-    if let Some(ref a) = active {
-        eprintln!("\nactive profile: {a}");
-    } else {
-        eprintln!("\nno active profile (using all servers)");
+            let install = match (npm, pip) {
+                (Some(pkg), _) => Some(config::InstallConfig::Npm { package: pkg }),
+                (_, Some(pkg)) => Some(config::InstallConfig::Pip { package: pkg }),
+                _ => None,
+            };
+
+            let rt = match runtime.as_deref() {
+                Some("local") => config::Runtime::Local,
+                _ => config::Runtime::Docker,
+            };
+
+            cfg.servers.insert(
+                name.clone(),
+                config::ServerConfig {
+                    install,
+                    runtime: rt,
+                    command,
+                    args,
+                    env: env.into_iter().collect(),
+                    env_toggle: None,
+                },
+            );
+
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ added server '{name}'");
+            Ok(())
+        }
+        ServerCmd::Remove { name } => {
+            let mut cfg = config::load(config_path)?;
+            if cfg.servers.remove(&name).is_none() {
+                anyhow::bail!("server '{name}' not found");
+            }
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ removed server '{name}'");
+            Ok(())
+        }
+        ServerCmd::Edit {
+            name,
+            command,
+            args,
+            env,
+            remove_env,
+            runtime,
+        } => {
+            let mut cfg = config::load(config_path)?;
+            let srv = cfg
+                .servers
+                .get_mut(&name)
+                .ok_or_else(|| anyhow::anyhow!("server '{name}' not found"))?;
+
+            if let Some(cmd) = command {
+                srv.command = cmd;
+            }
+            if let Some(a) = args {
+                srv.args = a;
+            }
+            for (k, v) in env {
+                srv.env.insert(k, v);
+            }
+            for k in remove_env {
+                srv.env.remove(&k);
+            }
+            if let Some(rt) = runtime {
+                srv.runtime = match rt.as_str() {
+                    "local" => config::Runtime::Local,
+                    _ => config::Runtime::Docker,
+                };
+            }
+
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ updated server '{name}'");
+            Ok(())
+        }
     }
-    Ok(())
 }
 
-fn cmd_switch(config_path: &std::path::Path, profile: Option<&str>) -> Result<()> {
-    let cfg = config::load(config_path)?;
+// ---------------------------------------------------------------------------
+// Profile management
+// ---------------------------------------------------------------------------
 
-    match profile {
-        Some(name) => {
-            // Validate the profile exists
-            let resolved = config::resolve(&cfg, Some(name))?;
-            config::write_active_profile(Some(name))?;
-            eprintln!("✅ switched to profile: {name}");
-            eprintln!(
-                "   {} server(s), {} custom tool(s)",
-                resolved.servers.len(),
-                resolved.custom_tools.len()
-            );
-            eprintln!("\nrestart the hub and clients to apply.");
+fn cmd_profile(config_path: &std::path::Path, action: cli::ProfileCmd) -> Result<()> {
+    use cli::ProfileCmd;
+
+    match action {
+        ProfileCmd::List => {
+            let cfg = config::load(config_path)?;
+            let active = config::read_active_profile();
+            let profiles = config::list_profiles(&cfg);
+
+            if profiles.is_empty() {
+                eprintln!("no profiles defined");
+                return Ok(());
+            }
+
+            for (name, desc) in &profiles {
+                let marker = if active.as_deref() == Some(*name) {
+                    " ◀ active"
+                } else {
+                    ""
+                };
+                let description = desc.unwrap_or("(no description)");
+                eprintln!("  {name:<16} {description}{marker}");
+
+                // Show server overrides in this profile
+                if let Some(p) = cfg.profiles.get(*name) {
+                    for srv in p.servers.keys() {
+                        eprintln!("    └─ {srv} (override)");
+                    }
+                }
+            }
+
+            if let Some(ref a) = active {
+                eprintln!("\nactive profile: {a}");
+            } else {
+                eprintln!("\nno active profile (using all servers)");
+            }
+            Ok(())
         }
-        None => {
-            config::write_active_profile(None)?;
-            eprintln!("✅ cleared active profile (using all servers)");
+        ProfileCmd::Add { name, description } => {
+            let mut cfg = config::load(config_path)?;
+            if cfg.profiles.contains_key(&name) {
+                anyhow::bail!("profile '{name}' already exists");
+            }
+            cfg.profiles.insert(
+                name.clone(),
+                config::ProfileConfig {
+                    description,
+                    ..Default::default()
+                },
+            );
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ created profile '{name}'");
+            Ok(())
+        }
+        ProfileCmd::Remove { name } => {
+            let mut cfg = config::load(config_path)?;
+            if cfg.profiles.remove(&name).is_none() {
+                anyhow::bail!("profile '{name}' not found");
+            }
+            // Clear active profile if we just removed it
+            if config::read_active_profile().as_deref() == Some(&name) {
+                config::write_active_profile(None)?;
+            }
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ removed profile '{name}'");
+            Ok(())
+        }
+        ProfileCmd::Set {
+            profile,
+            server,
+            command,
+            args,
+            env,
+            runtime,
+        } => {
+            let mut cfg = config::load(config_path)?;
+            let p = cfg
+                .profiles
+                .get_mut(&profile)
+                .ok_or_else(|| anyhow::anyhow!("profile '{profile}' not found"))?;
+
+            let ovr = p.servers.entry(server.clone()).or_default();
+
+            if let Some(cmd) = command {
+                ovr.command = Some(cmd);
+            }
+            if let Some(a) = args {
+                ovr.args = Some(a);
+            }
+            if !env.is_empty() {
+                let e = ovr.env.get_or_insert_with(HashMap::new);
+                for (k, v) in env {
+                    e.insert(k, v);
+                }
+            }
+            if let Some(rt) = runtime {
+                ovr.runtime = Some(match rt.as_str() {
+                    "local" => config::Runtime::Local,
+                    _ => config::Runtime::Docker,
+                });
+            }
+
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ set override for '{server}' in profile '{profile}'");
+            Ok(())
+        }
+        ProfileCmd::Unset { profile, server } => {
+            let mut cfg = config::load(config_path)?;
+            let p = cfg
+                .profiles
+                .get_mut(&profile)
+                .ok_or_else(|| anyhow::anyhow!("profile '{profile}' not found"))?;
+
+            if p.servers.remove(&server).is_none() {
+                anyhow::bail!("no override for '{server}' in profile '{profile}'");
+            }
+
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ removed override for '{server}' from profile '{profile}'");
+            Ok(())
+        }
+        ProfileCmd::Switch { name } => {
+            let cfg = config::load(config_path)?;
+            match name {
+                Some(ref n) => {
+                    let resolved = config::resolve(&cfg, Some(n))?;
+                    config::write_active_profile(Some(n))?;
+                    eprintln!("✅ switched to profile: {n}");
+                    eprintln!(
+                        "   {} server(s), {} custom tool(s)",
+                        resolved.servers.len(),
+                        resolved.custom_tools.len()
+                    );
+                }
+                None => {
+                    config::write_active_profile(None)?;
+                    eprintln!("✅ cleared active profile (using all servers)");
+                }
+            }
             eprintln!("\nrestart the hub and clients to apply.");
+            Ok(())
         }
     }
-    Ok(())
 }

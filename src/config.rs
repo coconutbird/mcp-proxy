@@ -273,6 +273,15 @@ pub fn load(path: &Path) -> Result<Config> {
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Save a config back to disk (pretty-printed JSON).
+pub fn save(path: &Path, cfg: &Config) -> Result<()> {
+    let json = serde_json::to_string_pretty(cfg)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{json}\n")).with_context(|| format!("writing {}", path.display()))
+}
+
 /// Resolve a profile against the base config.
 pub fn resolve(cfg: &Config, profile: Option<&str>) -> Result<ResolvedConfig> {
     let Some(name) = profile else {
