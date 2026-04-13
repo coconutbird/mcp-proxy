@@ -63,6 +63,9 @@ pub struct Backend {
 impl Backend {
     /// Spawn the server process, complete the MCP handshake, discover tools.
     /// `extra_env` are per-client overrides that take precedence over config env.
+    ///
+    /// If the command isn't found locally and the server has an `install` config,
+    /// we automatically build a Docker image and run the backend in a container.
     pub async fn start(
         name: String,
         cfg: &ServerConfig,
@@ -84,14 +87,25 @@ impl Backend {
             env.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
-        let mut child = Command::new(&cfg.command)
-            .args(&args)
-            .envs(&env)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("spawn '{}' ({}): {e}", name, cfg.command))?;
+        let use_docker = !crate::docker::command_exists(&cfg.command) && cfg.install.is_some();
+
+        let mut child = if use_docker {
+            info!(
+                "[{name}] command '{}' not found locally, using Docker",
+                cfg.command
+            );
+            crate::docker::ensure_image(&name, cfg).await?;
+            crate::docker::run_container(&name, cfg, extra_env).await?
+        } else {
+            Command::new(&cfg.command)
+                .args(&args)
+                .envs(&env)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| anyhow::anyhow!("spawn '{}' ({}): {e}", name, cfg.command))?
+        };
 
         let child_stdin = child.stdin.take().unwrap();
         let child_stdout = child.stdout.take().unwrap();

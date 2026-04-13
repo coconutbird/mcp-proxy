@@ -3,6 +3,7 @@ mod cli;
 mod clients;
 mod config;
 mod custom_tools;
+mod docker;
 mod generate;
 mod server;
 mod transport;
