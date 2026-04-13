@@ -87,10 +87,11 @@ impl Backend {
             env.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
-        let use_docker = cfg.install.is_some();
+        let use_docker =
+            cfg.install.is_some() && matches!(cfg.runtime, crate::config::Runtime::Docker);
 
         let mut child = if use_docker {
-            info!("[{name}] has install config, using Docker");
+            info!("[{name}] using Docker");
             crate::docker::ensure_image(&name, cfg).await?;
             crate::docker::run_container(&name, cfg, extra_env).await?
         } else {

@@ -29,7 +29,7 @@ pub fn init_config(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 // ---------------------------------------------------------------------------
-// Install method (for Docker generation only — not used at runtime)
+// Install method
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +57,17 @@ pub enum ExtractMethod {
     None,
 }
 
+/// Where to run a backend that has an `install` config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Runtime {
+    /// Run inside an auto-built Docker container (default).
+    #[default]
+    Docker,
+    /// Install and run directly on the host.
+    Local,
+}
+
 // ---------------------------------------------------------------------------
 // Server configuration
 // ---------------------------------------------------------------------------
@@ -64,9 +75,13 @@ pub enum ExtractMethod {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
-    /// How to install in Docker (optional, only used by `generate`).
+    /// How to install the server (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub install: Option<InstallConfig>,
+    /// Where to run: `docker` (default) or `local`. Only relevant when
+    /// `install` is set — servers without `install` always run locally.
+    #[serde(default, skip_serializing_if = "is_default_runtime")]
+    pub runtime: Runtime,
     /// Command to spawn the MCP server.
     pub command: String,
     /// Arguments passed to the command. Supports `${VAR}` expansion.
@@ -78,6 +93,10 @@ pub struct ServerConfig {
     /// Env var that can disable this server when set to `false` or `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_toggle: Option<String>,
+}
+
+fn is_default_runtime(r: &Runtime) -> bool {
+    matches!(r, Runtime::Docker)
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +166,8 @@ pub struct ServerOverride {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub install: Option<InstallConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<Runtime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<String>>,
@@ -175,6 +196,9 @@ impl ServerOverride {
         if let Some(ref install) = self.install {
             out.install = Some(install.clone());
         }
+        if let Some(ref rt) = self.runtime {
+            out.runtime = rt.clone();
+        }
         if self.env_toggle.is_some() {
             out.env_toggle.clone_from(&self.env_toggle);
         }
@@ -188,6 +212,7 @@ impl ServerOverride {
             args: self.args.unwrap_or_default(),
             env: self.env.unwrap_or_default(),
             install: self.install,
+            runtime: self.runtime.unwrap_or_default(),
             env_toggle: self.env_toggle,
         })
     }
