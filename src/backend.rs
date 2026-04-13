@@ -87,13 +87,10 @@ impl Backend {
             env.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
-        let use_docker = !crate::docker::command_exists(&cfg.command) && cfg.install.is_some();
+        let use_docker = cfg.install.is_some();
 
         let mut child = if use_docker {
-            info!(
-                "[{name}] command '{}' not found locally, using Docker",
-                cfg.command
-            );
+            info!("[{name}] has install config, using Docker");
             crate::docker::ensure_image(&name, cfg).await?;
             crate::docker::run_container(&name, cfg, extra_env).await?
         } else {

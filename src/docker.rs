@@ -186,8 +186,3 @@ pub async fn run_container(
 
     Ok(child)
 }
-
-/// Check whether a command exists on the local system.
-pub fn command_exists(cmd: &str) -> bool {
-    which::which(cmd).is_ok()
-}
