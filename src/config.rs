@@ -13,12 +13,7 @@ pub fn default_config_path() -> PathBuf {
         .join("servers.json")
 }
 
-const STARTER_CONFIG: &str = r#"{
-  "servers": {},
-  "customTools": {},
-  "profiles": {}
-}
-"#;
+const STARTER_CONFIG: &str = include_str!("../config/starter.json");
 
 /// Create a starter config file if it doesn't exist.
 /// Returns the path written to, or None if it already exists.
