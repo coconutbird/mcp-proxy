@@ -50,7 +50,16 @@ async fn main() -> Result<()> {
         cli::Cmd::Health { port } => cmd_health(port).await,
         cli::Cmd::Profiles => cmd_profiles(&args.config),
         cli::Cmd::Switch { profile: p } => cmd_switch(&args.config, p.as_deref()),
+        cli::Cmd::Init => cmd_init(&args.config),
     }
+}
+
+fn cmd_init(config_path: &std::path::Path) -> Result<()> {
+    match config::init_config(config_path)? {
+        Some(p) => eprintln!("created {}", p.display()),
+        None => eprintln!("config already exists: {}", config_path.display()),
+    }
+    Ok(())
 }
 
 async fn cmd_serve(
@@ -59,6 +68,11 @@ async fn cmd_serve(
     transport: &str,
     port: u16,
 ) -> Result<()> {
+    // Auto-create config if it doesn't exist
+    if let Some(p) = config::init_config(config_path)? {
+        eprintln!("created starter config: {}", p.display());
+        eprintln!("edit it to add your MCP servers, then restart.\n");
+    }
     let raw = config::load(config_path)?;
     let hub = Arc::new(server::Hub::new(raw, profile).await?);
 

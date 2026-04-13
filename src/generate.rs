@@ -103,7 +103,7 @@ pub fn env_example(config: &Config, out: &Path) -> Result<()> {
     }
 
     let mut s = String::from(
-        "# MCP Hub — Environment Configuration\n# Auto-generated from config/servers.json\n\nMCP_PORT=3000\n\n# Enable/disable servers (all enabled by default, set false to disable)\n",
+        "# MCP Proxy — Environment Configuration\n# Auto-generated from config/servers.json\n\nMCP_PORT=3000\n\n# Enable/disable servers (all enabled by default, set false to disable)\n",
     );
     for t in &toggles {
         s.push_str(&format!("{t}=true\n"));

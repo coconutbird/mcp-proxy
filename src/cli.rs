@@ -9,12 +9,7 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     /// Path to servers.json config file
-    #[arg(
-        short,
-        long,
-        env = "CONFIG_PATH",
-        default_value = "config/servers.json"
-    )]
+    #[arg(short, long, env = "CONFIG_PATH", default_value_os_t = crate::config::default_config_path())]
     pub config: PathBuf,
 
     /// Profile to use (overrides saved active profile)
@@ -85,4 +80,6 @@ pub enum Cmd {
         /// Profile name to activate (omit to clear/use all servers)
         profile: Option<String>,
     },
+    /// Create a starter servers.json config
+    Init,
 }

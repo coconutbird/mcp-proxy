@@ -1,9 +1,38 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Default config path: ~/.config/mcp-proxy/servers.json
+pub fn default_config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("mcp-proxy")
+        .join("servers.json")
+}
+
+const STARTER_CONFIG: &str = r#"{
+  "servers": {},
+  "customTools": {},
+  "profiles": {}
+}
+"#;
+
+/// Create a starter config file if it doesn't exist.
+/// Returns the path written to, or None if it already exists.
+pub fn init_config(path: &Path) -> Result<Option<PathBuf>> {
+    if path.exists() {
+        return Ok(None);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+    std::fs::write(path, STARTER_CONFIG).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(path.to_path_buf()))
+}
 
 // ---------------------------------------------------------------------------
 // Install method (for Docker generation only — not used at runtime)
