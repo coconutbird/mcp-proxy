@@ -17,9 +17,9 @@ use crate::server::Hub;
 
 struct Session {
     _id: String,
-    /// Per-client profile from X-MCP-Profile header.
+    /// Per-client server include list from X-MCP-Servers header.
     #[allow(dead_code)]
-    profile: Option<String>,
+    servers: Vec<String>,
     /// Per-client env overrides decoded from X-MCP-Env header.
     #[allow(dead_code)]
     env_overrides: HashMap<String, String>,
@@ -44,13 +44,18 @@ fn decode_env_header(headers: &HeaderMap) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-/// Extract requested profile from X-MCP-Profile header.
-fn decode_profile_header(headers: &HeaderMap) -> Option<String> {
+/// Decode X-MCP-Servers header: comma-separated list of server names.
+fn decode_servers_header(headers: &HeaderMap) -> Vec<String> {
     headers
-        .get("x-mcp-profile")
+        .get("x-mcp-servers")
         .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Start the Streamable-HTTP MCP server on the given port.
@@ -84,7 +89,7 @@ async fn handle_mcp(
 ) -> Response {
     // Decode per-client headers
     let env_overrides = decode_env_header(&headers);
-    let profile = decode_profile_header(&headers);
+    let servers = decode_servers_header(&headers);
 
     // Resolve or create session
     let session_id = match headers
@@ -97,14 +102,14 @@ async fn handle_mcp(
             let id = Uuid::new_v4().to_string();
             let id_clone = id.clone();
             let env_clone = env_overrides.clone();
-            let prof_clone = profile.clone();
+            let servers_clone = servers.clone();
             let sessions = state.sessions.clone();
             tokio::spawn(async move {
                 sessions.write().await.insert(
                     id.clone(),
                     Session {
                         _id: id,
-                        profile: prof_clone,
+                        servers: servers_clone,
                         env_overrides: env_clone,
                     },
                 );
@@ -121,14 +126,7 @@ async fn handle_mcp(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let id = req.get("id").cloned();
 
-    let result = handle_request(
-        &state.hub,
-        &method,
-        params,
-        profile.as_deref(),
-        &env_overrides,
-    )
-    .await;
+    let result = handle_request(&state.hub, &method, params, &servers, &env_overrides).await;
 
     // Notifications (no id) get 202 Accepted
     let Some(req_id) = id else {
@@ -172,7 +170,7 @@ async fn handle_request(
     hub: &Hub,
     method: &str,
     params: Value,
-    profile: Option<&str>,
+    servers: &[String],
     env_overrides: &HashMap<String, String>,
 ) -> anyhow::Result<Value> {
     match method {
@@ -183,7 +181,7 @@ async fn handle_request(
         })),
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
-            let tools = hub.list_tools_for(profile, env_overrides).await;
+            let tools = hub.list_tools_for(servers, env_overrides).await;
             Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -192,7 +190,7 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-            hub.call_tool_for(name, args, profile, env_overrides).await
+            hub.call_tool_for(name, args, servers, env_overrides).await
         }
         _ => anyhow::bail!("unsupported method: {method}"),
     }

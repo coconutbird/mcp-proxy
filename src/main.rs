@@ -38,10 +38,11 @@ async fn main() -> Result<()> {
         cli::Cmd::Bridge {
             url,
             profile: bridge_profile,
+            servers,
             forward_env,
         } => {
             let p = bridge_profile.as_deref().or(profile.as_deref());
-            transport::bridge::run(&url, p, &forward_env).await
+            transport::bridge::run(&url, p, &servers, &forward_env, &args.config).await
         }
         cli::Cmd::Generate { target, dir } => {
             cmd_generate(&args.config, profile.as_deref(), &target, &dir)
@@ -67,7 +68,7 @@ fn cmd_init(config_path: &std::path::Path) -> Result<()> {
 
 async fn cmd_serve(
     config_path: &std::path::Path,
-    profile: Option<&str>,
+    _profile: Option<&str>,
     transport: &str,
     port: u16,
 ) -> Result<()> {
@@ -77,7 +78,7 @@ async fn cmd_serve(
         eprintln!("edit it to add your MCP servers, then restart.\n");
     }
     let raw = config::load(config_path)?;
-    let hub = Arc::new(server::Hub::new(raw, profile).await?);
+    let hub = Arc::new(server::Hub::new(raw).await?);
 
     // Shutdown on ctrl-c
     let hub2 = hub.clone();
@@ -469,21 +470,17 @@ fn cmd_profile(config_path: &std::path::Path, action: cli::ProfileCmd) -> Result
             let cfg = config::load(config_path)?;
             match name {
                 Some(ref n) => {
-                    let resolved = config::resolve(&cfg, Some(n))?;
+                    if !cfg.profiles.contains_key(n.as_str()) {
+                        anyhow::bail!("profile '{n}' not found");
+                    }
                     config::write_active_profile(Some(n))?;
                     eprintln!("✅ switched to profile: {n}");
-                    eprintln!(
-                        "   {} server(s), {} custom tool(s)",
-                        resolved.servers.len(),
-                        resolved.custom_tools.len()
-                    );
                 }
                 None => {
                     config::write_active_profile(None)?;
                     eprintln!("✅ cleared active profile (using all servers)");
                 }
             }
-            eprintln!("\nrestart the hub and clients to apply.");
             Ok(())
         }
     }

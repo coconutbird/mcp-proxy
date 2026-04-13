@@ -177,71 +177,25 @@ pub struct ServerOverride {
     pub env_toggle: Option<String>,
 }
 
-impl ServerOverride {
-    /// Merge this override onto a base `ServerConfig`, returning the result.
-    fn apply_to(&self, base: &ServerConfig) -> ServerConfig {
-        let mut out = base.clone();
-        if let Some(ref cmd) = self.command {
-            out.command = cmd.clone();
-        }
-        if let Some(ref args) = self.args {
-            out.args = args.clone();
-        }
-        if let Some(ref env) = self.env {
-            // Shallow merge: override keys win, base keys preserved
-            for (k, v) in env {
-                out.env.insert(k.clone(), v.clone());
-            }
-        }
-        if let Some(ref install) = self.install {
-            out.install = Some(install.clone());
-        }
-        if let Some(ref rt) = self.runtime {
-            out.runtime = rt.clone();
-        }
-        if self.env_toggle.is_some() {
-            out.env_toggle.clone_from(&self.env_toggle);
-        }
-        out
-    }
-
-    /// Convert to a full ServerConfig (for new profile-only servers).
-    fn into_server_config(self) -> Option<ServerConfig> {
-        Some(ServerConfig {
-            command: self.command?,
-            args: self.args.unwrap_or_default(),
-            env: self.env.unwrap_or_default(),
-            install: self.install,
-            runtime: self.runtime.unwrap_or_default(),
-            env_toggle: self.env_toggle,
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Profile configuration
+// Client-side profile configuration
 // ---------------------------------------------------------------------------
 
+/// Profiles are client-side: they tell the bridge which servers to request
+/// from the hub and what env overrides to send. The server never sees profile
+/// names — it just receives `X-MCP-Servers` and `X-MCP-Env` headers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileConfig {
     /// Human-readable description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Servers to include (if set, only these + profile servers are used).
+    /// Which servers to request from the hub (empty = all).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
-    /// Servers to exclude from the base set.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exclude: Vec<String>,
-    /// Server overrides and additions. If a key matches a base server name,
-    /// the fields are merged onto the base. Otherwise it's a new server
-    /// (must have `command`).
+    /// Per-server env overrides sent to the hub via X-MCP-Env.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub servers: HashMap<String, ServerOverride>,
-    /// Additional custom tools only available in this profile.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub custom_tools: HashMap<String, CustomToolConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,13 +213,6 @@ pub struct Config {
     pub profiles: HashMap<String, ProfileConfig>,
 }
 
-/// The resolved config after applying a profile.
-#[derive(Debug, Clone)]
-pub struct ResolvedConfig {
-    pub servers: HashMap<String, ServerConfig>,
-    pub custom_tools: HashMap<String, CustomToolConfig>,
-}
-
 /// Load and parse a JSON config file.
 pub fn load(path: &Path) -> Result<Config> {
     let raw =
@@ -280,70 +227,6 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, format!("{json}\n")).with_context(|| format!("writing {}", path.display()))
-}
-
-/// Resolve a profile against the base config.
-pub fn resolve(cfg: &Config, profile: Option<&str>) -> Result<ResolvedConfig> {
-    let Some(name) = profile else {
-        return Ok(ResolvedConfig {
-            servers: cfg.servers.clone(),
-            custom_tools: cfg.custom_tools.clone(),
-        });
-    };
-
-    let prof = cfg
-        .profiles
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("unknown profile: {name}"))?;
-
-    // 1. Start with base servers, filtered by include/exclude
-    let mut servers: HashMap<String, ServerConfig> = if !prof.include.is_empty() {
-        // Include list also picks up servers named in the profile's servers block
-        cfg.servers
-            .iter()
-            .filter(|(k, _)| prof.include.iter().any(|i| i == *k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    } else {
-        cfg.servers
-            .iter()
-            .filter(|(k, _)| !prof.exclude.iter().any(|e| e == *k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    };
-
-    // 2. Apply profile server overrides / additions
-    for (srv_name, ovr) in &prof.servers {
-        if let Some(base) = cfg.servers.get(srv_name) {
-            // Override: merge onto the base server config
-            servers.insert(srv_name.clone(), ovr.apply_to(base));
-        } else {
-            // New server: must have a command
-            match ovr.clone().into_server_config() {
-                Some(srv) => {
-                    servers.insert(srv_name.clone(), srv);
-                }
-                None => anyhow::bail!(
-                    "profile '{name}': server '{srv_name}' is not in base and has no command",
-                ),
-            }
-        }
-    }
-
-    // 3. Custom tools: base set (filtered if include is used) + profile additions
-    let mut custom_tools = if !prof.include.is_empty() {
-        HashMap::new()
-    } else {
-        cfg.custom_tools.clone()
-    };
-    for (k, v) in &prof.custom_tools {
-        custom_tools.insert(k.clone(), v.clone());
-    }
-
-    Ok(ResolvedConfig {
-        servers,
-        custom_tools,
-    })
 }
 
 /// List available profile names from a config.

@@ -36,10 +36,13 @@ pub enum Cmd {
         /// URL of the hub HTTP endpoint
         #[arg(long, default_value = "http://localhost:3000/mcp")]
         url: String,
-        /// Profile override (passed by client config)
+        /// Client-side profile (reads local config for server list + env)
         #[arg(long)]
         profile: Option<String>,
-        /// Comma-separated env var names to forward to the hub.
+        /// Explicit server list (overrides profile include list)
+        #[arg(long, value_delimiter = ',')]
+        servers: Vec<String>,
+        /// Comma-separated env var names to forward to the hub
         #[arg(long, value_delimiter = ',')]
         forward_env: Vec<String>,
     },
