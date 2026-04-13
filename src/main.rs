@@ -33,8 +33,13 @@ async fn main() -> Result<()> {
             cmd_serve(&args.config, profile.as_deref(), &transport, port).await
         }
         cli::Cmd::Bridge {
-            url, forward_env, ..
-        } => transport::bridge::run(&url, &forward_env).await,
+            url,
+            profile: bridge_profile,
+            forward_env,
+        } => {
+            let p = bridge_profile.as_deref().or(profile.as_deref());
+            transport::bridge::run(&url, p, &forward_env).await
+        }
         cli::Cmd::Generate { target, dir } => {
             cmd_generate(&args.config, profile.as_deref(), &target, &dir)
         }
@@ -54,8 +59,8 @@ async fn cmd_serve(
     transport: &str,
     port: u16,
 ) -> Result<()> {
-    let cfg = config::load_with_profile(config_path, profile)?;
-    let hub = Arc::new(server::Hub::from_config(&cfg).await?);
+    let raw = config::load(config_path)?;
+    let hub = Arc::new(server::Hub::new(raw, profile).await?);
 
     // Shutdown on ctrl-c
     let hub2 = hub.clone();

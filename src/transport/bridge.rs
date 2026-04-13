@@ -34,12 +34,15 @@ fn encode_env_header(env: &HashMap<String, String>) -> Option<String> {
 /// Run the bridge, forwarding stdin → HTTP → stdout.
 /// `forward_env` lists env var names to read from the local process and
 /// send to the hub as an `X-MCP-Env` header.
-pub async fn run(url: &str, forward_env: &[String]) -> Result<()> {
+pub async fn run(url: &str, profile: Option<&str>, forward_env: &[String]) -> Result<()> {
     let client = reqwest::Client::new();
     let mut session_id: Option<String> = None;
     let env_overrides = collect_env_overrides(forward_env);
     let env_header = encode_env_header(&env_overrides);
 
+    if let Some(p) = profile {
+        eprintln!("bridge profile: {p}");
+    }
     if !env_overrides.is_empty() {
         eprintln!(
             "bridge forwarding {} env var(s): {}",
@@ -71,6 +74,10 @@ pub async fn run(url: &str, forward_env: &[String]) -> Result<()> {
 
         if let Some(ref hdr) = env_header {
             req = req.header("x-mcp-env", hdr);
+        }
+
+        if let Some(p) = profile {
+            req = req.header("x-mcp-profile", p);
         }
 
         match req.body(line).send().await {

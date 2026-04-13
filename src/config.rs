@@ -216,7 +216,6 @@ pub struct Config {
 pub struct ResolvedConfig {
     pub servers: HashMap<String, ServerConfig>,
     pub custom_tools: HashMap<String, CustomToolConfig>,
-    pub profile_name: Option<String>,
 }
 
 /// Load and parse a JSON config file.
@@ -226,19 +225,12 @@ pub fn load(path: &Path) -> Result<Config> {
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Load config and resolve a profile. If `profile` is None, uses all base servers.
-pub fn load_with_profile(path: &Path, profile: Option<&str>) -> Result<ResolvedConfig> {
-    let cfg = load(path)?;
-    resolve(&cfg, profile)
-}
-
 /// Resolve a profile against the base config.
 pub fn resolve(cfg: &Config, profile: Option<&str>) -> Result<ResolvedConfig> {
     let Some(name) = profile else {
         return Ok(ResolvedConfig {
             servers: cfg.servers.clone(),
             custom_tools: cfg.custom_tools.clone(),
-            profile_name: None,
         });
     };
 
@@ -294,7 +286,6 @@ pub fn resolve(cfg: &Config, profile: Option<&str>) -> Result<ResolvedConfig> {
     Ok(ResolvedConfig {
         servers,
         custom_tools,
-        profile_name: Some(name.into()),
     })
 }
 

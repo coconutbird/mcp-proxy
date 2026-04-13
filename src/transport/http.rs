@@ -17,6 +17,9 @@ use crate::server::Hub;
 
 struct Session {
     _id: String,
+    /// Per-client profile from X-MCP-Profile header.
+    #[allow(dead_code)]
+    profile: Option<String>,
     /// Per-client env overrides decoded from X-MCP-Env header.
     #[allow(dead_code)]
     env_overrides: HashMap<String, String>,
@@ -39,6 +42,15 @@ fn decode_env_header(headers: &HeaderMap) -> HashMap<String, String> {
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(&bytes).ok())
         .unwrap_or_default()
+}
+
+/// Extract requested profile from X-MCP-Profile header.
+fn decode_profile_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-mcp-profile")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .filter(|s| !s.is_empty())
 }
 
 /// Start the Streamable-HTTP MCP server on the given port.
@@ -70,8 +82,9 @@ async fn handle_mcp(
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> Response {
-    // Decode per-client env overrides from X-MCP-Env header
+    // Decode per-client headers
     let env_overrides = decode_env_header(&headers);
+    let profile = decode_profile_header(&headers);
 
     // Resolve or create session
     let session_id = match headers
@@ -84,12 +97,14 @@ async fn handle_mcp(
             let id = Uuid::new_v4().to_string();
             let id_clone = id.clone();
             let env_clone = env_overrides.clone();
+            let prof_clone = profile.clone();
             let sessions = state.sessions.clone();
             tokio::spawn(async move {
                 sessions.write().await.insert(
                     id.clone(),
                     Session {
                         _id: id,
+                        profile: prof_clone,
                         env_overrides: env_clone,
                     },
                 );
@@ -106,7 +121,14 @@ async fn handle_mcp(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let id = req.get("id").cloned();
 
-    let result = handle_request(&state.hub, &method, params, &env_overrides).await;
+    let result = handle_request(
+        &state.hub,
+        &method,
+        params,
+        profile.as_deref(),
+        &env_overrides,
+    )
+    .await;
 
     // Notifications (no id) get 202 Accepted
     let Some(req_id) = id else {
@@ -150,6 +172,7 @@ async fn handle_request(
     hub: &Hub,
     method: &str,
     params: Value,
+    profile: Option<&str>,
     env_overrides: &HashMap<String, String>,
 ) -> anyhow::Result<Value> {
     match method {
@@ -160,7 +183,7 @@ async fn handle_request(
         })),
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
-            let tools = hub.list_tools_with_env(env_overrides).await;
+            let tools = hub.list_tools_for(profile, env_overrides).await;
             Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -169,7 +192,7 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-            hub.call_tool_with_env(name, args, env_overrides).await
+            hub.call_tool_for(name, args, profile, env_overrides).await
         }
         _ => anyhow::bail!("unsupported method: {method}"),
     }

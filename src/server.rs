@@ -7,27 +7,34 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::backend::{Backend, Tool};
-use crate::config::{ResolvedConfig, ServerConfig, is_toggled_off};
+use crate::config::{self, Config, ResolvedConfig, is_toggled_off};
 use crate::custom_tools::CustomTools;
 
-/// Key for a backend pool — hash of env overrides so clients with the
-/// same env share backend processes.
-fn env_pool_key(env: &HashMap<String, String>) -> String {
+/// A pool of backends spawned for a specific profile + env combination.
+struct BackendPool {
+    backends: HashMap<String, Backend>,
+    custom: Arc<CustomTools>,
+    #[allow(dead_code)]
+    profile: Option<String>,
+}
+
+/// Composite key: profile name + env overrides hash.
+fn pool_key(profile: Option<&str>, env: &HashMap<String, String>) -> String {
+    let p = profile.unwrap_or("__default__");
     if env.is_empty() {
-        return String::new();
+        return p.to_string();
     }
     let mut pairs: Vec<_> = env.iter().collect();
     pairs.sort_by_key(|(k, _)| (*k).clone());
-    let joined: String = pairs
+    let env_part: String = pairs
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("\0");
-    format!("{:x}", md5_hash(&joined))
+    format!("{p}:{:x}", djb2_hash(&env_part))
 }
 
-/// Simple non-crypto hash (djb2) for pool keying — no extra dependency.
-fn md5_hash(s: &str) -> u64 {
+fn djb2_hash(s: &str) -> u64 {
     let mut h: u64 = 5381;
     for b in s.bytes() {
         h = h.wrapping_mul(33).wrapping_add(b as u64);
@@ -35,209 +42,220 @@ fn md5_hash(s: &str) -> u64 {
     h
 }
 
-/// A pool of backends spawned with a specific set of env overrides.
-struct BackendPool {
-    backends: HashMap<String, Backend>,
-    #[allow(dead_code)]
-    env_overrides: HashMap<String, String>,
+/// Boot backends from a resolved config, optionally layering env overrides.
+async fn spawn_backends(
+    resolved: &ResolvedConfig,
+    env_overrides: &HashMap<String, String>,
+) -> (HashMap<String, Backend>, Arc<CustomTools>) {
+    let mut backends = HashMap::new();
+    for (name, srv) in &resolved.servers {
+        if name.starts_with('_') {
+            continue;
+        }
+        if is_toggled_off(srv.env_toggle.as_deref()) {
+            eprintln!("  skipping {name} (toggled off)");
+            continue;
+        }
+        eprintln!("  starting backend: {name}");
+        match Backend::start(name.clone(), srv, env_overrides).await {
+            Ok(be) => {
+                backends.insert(name.clone(), be);
+            }
+            Err(e) => eprintln!("  failed to start {name}: {e}"),
+        }
+    }
+    let custom = Arc::new(CustomTools::new(&resolved.custom_tools));
+    (backends, custom)
 }
 
-/// The aggregator: holds the default backends + lazily-spawned env pools
-/// for clients with custom env overrides.
+/// The aggregator: holds backend pools keyed by (profile, env) and
+/// lazily spawns new pools when a client requests a different profile
+/// or provides env overrides.
 pub struct Hub {
-    /// Default backends (no env overrides).
-    pub backends: Arc<RwLock<HashMap<String, Backend>>>,
-    /// Per-env-override backend pools, keyed by env hash.
-    env_pools: Arc<RwLock<HashMap<String, BackendPool>>>,
-    /// Resolved server configs (needed to spawn new pools).
-    server_configs: HashMap<String, ServerConfig>,
-    pub custom: Arc<CustomTools>,
-    pub profile_name: Option<String>,
+    /// Full raw config — needed to resolve arbitrary profiles on demand.
+    raw_config: Config,
+    /// Default profile name the hub was started with.
+    pub default_profile: Option<String>,
+    /// Backend pools keyed by (profile + env hash).
+    pools: Arc<RwLock<HashMap<String, BackendPool>>>,
 }
 
 impl Hub {
-    /// Boot all configured backends and custom tools from a resolved config.
-    pub async fn from_config(config: &ResolvedConfig) -> Result<Self> {
+    /// Boot the hub with a full config. The default pool uses `profile`.
+    pub async fn new(raw_config: Config, profile: Option<&str>) -> Result<Self> {
+        if let Some(p) = profile {
+            eprintln!("default profile: {p}");
+        }
+
+        let resolved = config::resolve(&raw_config, profile)?;
         let empty_env = HashMap::new();
-        let mut backends = HashMap::new();
+        let key = pool_key(profile, &empty_env);
 
-        if let Some(ref p) = config.profile_name {
-            eprintln!("profile: {p}");
-        }
+        eprintln!("starting default pool ({key}):");
+        let (backends, custom) = spawn_backends(&resolved, &empty_env).await;
 
-        for (name, srv) in &config.servers {
-            if name.starts_with('_') {
-                continue;
-            }
-            if is_toggled_off(srv.env_toggle.as_deref()) {
-                eprintln!("skipping {name} (toggled off)");
-                continue;
-            }
-            eprintln!("starting backend: {name}");
-            match Backend::start(name.clone(), srv, &empty_env).await {
-                Ok(be) => {
-                    backends.insert(name.clone(), be);
-                }
-                Err(e) => eprintln!("failed to start {name}: {e}"),
-            }
-        }
-
-        let custom = CustomTools::new(&config.custom_tools);
+        let mut pools = HashMap::new();
+        pools.insert(
+            key,
+            BackendPool {
+                backends,
+                custom,
+                profile: profile.map(String::from),
+            },
+        );
 
         Ok(Self {
-            backends: Arc::new(RwLock::new(backends)),
-            env_pools: Arc::default(),
-            server_configs: config.servers.clone(),
-            custom: Arc::new(custom),
-            profile_name: config.profile_name.clone(),
+            raw_config,
+            default_profile: profile.map(String::from),
+            pools: Arc::new(RwLock::new(pools)),
         })
     }
 
-    /// Collect every tool from every backend + custom tools (default env).
-    pub async fn list_tools(&self) -> Vec<Tool> {
-        self.list_tools_with_env(&HashMap::new()).await
-    }
+    /// Ensure a pool exists for the given profile + env, spawning if needed.
+    /// Returns the pool key.
+    async fn ensure_pool(
+        &self,
+        profile: Option<&str>,
+        env_overrides: &HashMap<String, String>,
+    ) -> Result<String> {
+        let key = pool_key(profile, env_overrides);
 
-    /// List tools, using an env-specific pool if overrides are present.
-    pub async fn list_tools_with_env(&self, env_overrides: &HashMap<String, String>) -> Vec<Tool> {
-        let mut out = Vec::new();
-
-        if env_overrides.is_empty() {
-            let backends = self.backends.read().await;
-            for be in backends.values() {
-                out.extend(be.tools.iter().cloned());
-            }
-        } else {
-            let pool = self.get_or_create_pool(env_overrides).await;
-            let pools = self.env_pools.read().await;
-            if let Some(p) = pools.get(&pool) {
-                for be in p.backends.values() {
-                    out.extend(be.tools.iter().cloned());
-                }
+        // Fast path
+        {
+            let pools = self.pools.read().await;
+            if pools.contains_key(&key) {
+                return Ok(key);
             }
         }
 
-        out.extend(self.custom.list());
+        // Slow path: resolve profile + spawn
+        let effective_profile = profile.or(self.default_profile.as_deref());
+        info!(
+            "spawning pool: profile={effective_profile:?}, env_keys={:?}",
+            env_overrides.keys().collect::<Vec<_>>()
+        );
+
+        let resolved = config::resolve(&self.raw_config, effective_profile)?;
+        let (backends, custom) = spawn_backends(&resolved, env_overrides).await;
+
+        let mut pools = self.pools.write().await;
+        pools.insert(
+            key.clone(),
+            BackendPool {
+                backends,
+                custom,
+                profile: effective_profile.map(String::from),
+            },
+        );
+        Ok(key)
+    }
+
+    /// Resolve which pool to use: explicit profile > default.
+    fn effective_profile<'a>(&'a self, requested: Option<&'a str>) -> Option<&'a str> {
+        requested.or(self.default_profile.as_deref())
+    }
+
+    /// List tools for a given profile + env combination.
+    pub async fn list_tools_for(
+        &self,
+        profile: Option<&str>,
+        env_overrides: &HashMap<String, String>,
+    ) -> Vec<Tool> {
+        let effective = self.effective_profile(profile);
+        let key = match self.ensure_pool(effective, env_overrides).await {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("pool error: {e}");
+                return Vec::new();
+            }
+        };
+        let pools = self.pools.read().await;
+        let Some(pool) = pools.get(&key) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Tool> = pool
+            .backends
+            .values()
+            .flat_map(|be| be.tools.iter().cloned())
+            .collect();
+        out.extend(pool.custom.list());
         out
     }
 
-    /// Route a tool call to the right backend or custom tool (default env).
-    pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value> {
-        self.call_tool_with_env(name, args, &HashMap::new()).await
-    }
-
-    /// Route a tool call with per-client env overrides.
-    pub async fn call_tool_with_env(
+    /// Route a tool call for a given profile + env combination.
+    pub async fn call_tool_for(
         &self,
         name: &str,
         args: Value,
+        profile: Option<&str>,
         env_overrides: &HashMap<String, String>,
     ) -> Result<Value> {
+        let effective = self.effective_profile(profile);
+        let key = self.ensure_pool(effective, env_overrides).await?;
+        let pools = self.pools.read().await;
+        let pool = pools
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("pool not found: {key}"))?;
+
         // Check custom tools first
-        if self.custom.has(name) {
-            return self.custom.call(name, &args).await;
+        if pool.custom.has(name) {
+            return pool.custom.call(name, &args).await;
         }
 
-        if env_overrides.is_empty() {
-            // Use default pool
-            let backends = self.backends.read().await;
-            for be in backends.values() {
-                let prefix = format!("{}_", be.name);
-                if let Some(original) = name.strip_prefix(&prefix) {
-                    return be.call_tool(original, args).await;
-                }
-            }
-        } else {
-            // Use env-specific pool
-            let pool_key = self.get_or_create_pool(env_overrides).await;
-            let pools = self.env_pools.read().await;
-            if let Some(pool) = pools.get(&pool_key) {
-                for be in pool.backends.values() {
-                    let prefix = format!("{}_", be.name);
-                    if let Some(original) = name.strip_prefix(&prefix) {
-                        return be.call_tool(original, args).await;
-                    }
-                }
+        // Find backend by prefix
+        for be in pool.backends.values() {
+            let prefix = format!("{}_", be.name);
+            if let Some(original) = name.strip_prefix(&prefix) {
+                return be.call_tool(original, args).await;
             }
         }
 
         anyhow::bail!("unknown tool: {name}");
     }
 
-    /// Get or lazily create a backend pool for the given env overrides.
-    /// Returns the pool key.
-    async fn get_or_create_pool(&self, env_overrides: &HashMap<String, String>) -> String {
-        let key = env_pool_key(env_overrides);
+    // -- Convenience wrappers for default profile, no env overrides --
 
-        // Fast path: pool already exists
-        {
-            let pools = self.env_pools.read().await;
-            if pools.contains_key(&key) {
-                return key;
-            }
-        }
+    pub async fn list_tools(&self) -> Vec<Tool> {
+        self.list_tools_for(None, &HashMap::new()).await
+    }
 
-        // Slow path: spawn backends with env overrides
-        info!(
-            "spawning backend pool for env overrides: {:?}",
-            env_overrides.keys().collect::<Vec<_>>()
-        );
-
-        let mut backends = HashMap::new();
-        for (name, srv) in &self.server_configs {
-            if name.starts_with('_') {
-                continue;
-            }
-            if is_toggled_off(srv.env_toggle.as_deref()) {
-                continue;
-            }
-            match Backend::start(name.clone(), srv, env_overrides).await {
-                Ok(be) => {
-                    backends.insert(name.clone(), be);
-                }
-                Err(e) => eprintln!("failed to start {name} (env pool): {e}"),
-            }
-        }
-
-        let mut pools = self.env_pools.write().await;
-        pools.insert(
-            key.clone(),
-            BackendPool {
-                backends,
-                env_overrides: env_overrides.clone(),
-            },
-        );
-        key
+    pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value> {
+        self.call_tool_for(name, args, None, &HashMap::new()).await
     }
 
     /// Health summary for /health endpoint.
     pub async fn health(&self) -> Value {
-        let backends = self.backends.read().await;
-        let items: Vec<Value> = backends
-            .values()
-            .map(|b| {
+        let pools = self.pools.read().await;
+        let pool_summaries: Vec<Value> = pools
+            .iter()
+            .map(|(key, pool)| {
+                let backends: Vec<Value> = pool
+                    .backends
+                    .values()
+                    .map(|b| {
+                        serde_json::json!({
+                            "name": b.name,
+                            "ready": b.ready,
+                            "tools": b.tools.len(),
+                        })
+                    })
+                    .collect();
                 serde_json::json!({
-                    "name": b.name,
-                    "ready": b.ready,
-                    "tools": b.tools.len(),
+                    "pool": key,
+                    "profile": pool.profile,
+                    "backends": backends,
                 })
             })
             .collect();
-        let pool_count = self.env_pools.read().await.len();
         serde_json::json!({
-            "backends": items,
-            "profile": self.profile_name,
-            "envPools": pool_count,
+            "defaultProfile": self.default_profile,
+            "pools": pool_summaries,
         })
     }
 
-    /// Kill all backend processes (default + all env pools).
+    /// Kill all backend processes across all pools.
     pub async fn shutdown(&self) {
-        let mut backends = self.backends.write().await;
-        for be in backends.values_mut() {
-            be.kill();
-        }
-        let mut pools = self.env_pools.write().await;
+        let mut pools = self.pools.write().await;
         for pool in pools.values_mut() {
             for be in pool.backends.values_mut() {
                 be.kill();
