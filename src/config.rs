@@ -7,10 +7,9 @@ use serde_json::Value;
 
 /// Default config path: ~/.config/mcp-proxy/servers.json
 pub fn default_config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
-        .join("mcp-proxy")
-        .join("servers.json")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/mcp-proxy/servers.json")
 }
 
 const STARTER_CONFIG: &str = include_str!("../config/starter.json");
@@ -322,11 +321,13 @@ pub fn list_profiles(cfg: &Config) -> Vec<(&str, Option<&str>)> {
 }
 
 // ---------------------------------------------------------------------------
-// Active profile persistence (~/.mcp-proxy/active-profile)
+// Active profile persistence (~/.config/mcp-proxy/active-profile)
 // ---------------------------------------------------------------------------
 
-fn profile_state_path() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".mcp-proxy")
+fn profile_state_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/mcp-proxy")
 }
 
 pub fn read_active_profile() -> Option<String> {
