@@ -209,18 +209,16 @@ pub struct Config {
     pub servers: HashMap<String, ServerConfig>,
     #[serde(default)]
     pub custom_tools: HashMap<String, CustomToolConfig>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub profiles: HashMap<String, ProfileConfig>,
 }
 
-/// Load and parse a JSON config file.
+/// Load and parse the servers config file.
 pub fn load(path: &Path) -> Result<Config> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Save a config back to disk (pretty-printed JSON).
+/// Save the servers config back to disk (pretty-printed JSON).
 pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     let json = serde_json::to_string_pretty(cfg)?;
     if let Some(parent) = path.parent() {
@@ -229,9 +227,51 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     std::fs::write(path, format!("{json}\n")).with_context(|| format!("writing {}", path.display()))
 }
 
-/// List available profile names from a config.
-pub fn list_profiles(cfg: &Config) -> Vec<(&str, Option<&str>)> {
-    cfg.profiles
+// ---------------------------------------------------------------------------
+// Profiles file (separate from servers.json)
+// ---------------------------------------------------------------------------
+
+/// Wrapper for the profiles.json file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfilesFile {
+    #[serde(default)]
+    pub profiles: HashMap<String, ProfileConfig>,
+}
+
+/// Derive the profiles.json path from the servers.json path (same directory).
+pub fn profiles_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("profiles.json")
+}
+
+/// Load profiles from profiles.json. Returns empty map if file doesn't exist.
+pub fn load_profiles(config_path: &Path) -> Result<ProfilesFile> {
+    let path = profiles_path(config_path);
+    if !path.exists() {
+        return Ok(ProfilesFile::default());
+    }
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Save profiles to profiles.json.
+pub fn save_profiles(config_path: &Path, profiles: &ProfilesFile) -> Result<()> {
+    let path = profiles_path(config_path);
+    let json = serde_json::to_string_pretty(profiles)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, format!("{json}\n"))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// List available profile names.
+pub fn list_profiles(profiles: &ProfilesFile) -> Vec<(&str, Option<&str>)> {
+    profiles
+        .profiles
         .iter()
         .map(|(name, p)| (name.as_str(), p.description.as_deref()))
         .collect()

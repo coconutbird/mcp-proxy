@@ -350,9 +350,9 @@ fn cmd_profile(config_path: &std::path::Path, action: cli::ProfileCmd) -> Result
 
     match action {
         ProfileCmd::List => {
-            let cfg = config::load(config_path)?;
+            let pf = config::load_profiles(config_path)?;
             let active = config::read_active_profile();
-            let profiles = config::list_profiles(&cfg);
+            let profiles = config::list_profiles(&pf);
 
             if profiles.is_empty() {
                 eprintln!("no profiles defined");
@@ -368,8 +368,7 @@ fn cmd_profile(config_path: &std::path::Path, action: cli::ProfileCmd) -> Result
                 let description = desc.unwrap_or("(no description)");
                 eprintln!("  {name:<16} {description}{marker}");
 
-                // Show server overrides in this profile
-                if let Some(p) = cfg.profiles.get(*name) {
+                if let Some(p) = pf.profiles.get(*name) {
                     for srv in p.servers.keys() {
                         eprintln!("    └─ {srv} (override)");
                     }
@@ -384,31 +383,30 @@ fn cmd_profile(config_path: &std::path::Path, action: cli::ProfileCmd) -> Result
             Ok(())
         }
         ProfileCmd::Add { name, description } => {
-            let mut cfg = config::load(config_path)?;
-            if cfg.profiles.contains_key(&name) {
+            let mut pf = config::load_profiles(config_path)?;
+            if pf.profiles.contains_key(&name) {
                 anyhow::bail!("profile '{name}' already exists");
             }
-            cfg.profiles.insert(
+            pf.profiles.insert(
                 name.clone(),
                 config::ProfileConfig {
                     description,
                     ..Default::default()
                 },
             );
-            config::save(config_path, &cfg)?;
+            config::save_profiles(config_path, &pf)?;
             eprintln!("✅ created profile '{name}'");
             Ok(())
         }
         ProfileCmd::Remove { name } => {
-            let mut cfg = config::load(config_path)?;
-            if cfg.profiles.remove(&name).is_none() {
+            let mut pf = config::load_profiles(config_path)?;
+            if pf.profiles.remove(&name).is_none() {
                 anyhow::bail!("profile '{name}' not found");
             }
-            // Clear active profile if we just removed it
             if config::read_active_profile().as_deref() == Some(&name) {
                 config::write_active_profile(None)?;
             }
-            config::save(config_path, &cfg)?;
+            config::save_profiles(config_path, &pf)?;
             eprintln!("✅ removed profile '{name}'");
             Ok(())
         }
@@ -420,8 +418,8 @@ fn cmd_profile(config_path: &std::path::Path, action: cli::ProfileCmd) -> Result
             env,
             runtime,
         } => {
-            let mut cfg = config::load(config_path)?;
-            let p = cfg
+            let mut pf = config::load_profiles(config_path)?;
+            let p = pf
                 .profiles
                 .get_mut(&profile)
                 .ok_or_else(|| anyhow::anyhow!("profile '{profile}' not found"))?;
@@ -447,13 +445,13 @@ fn cmd_profile(config_path: &std::path::Path, action: cli::ProfileCmd) -> Result
                 });
             }
 
-            config::save(config_path, &cfg)?;
+            config::save_profiles(config_path, &pf)?;
             eprintln!("✅ set override for '{server}' in profile '{profile}'");
             Ok(())
         }
         ProfileCmd::Unset { profile, server } => {
-            let mut cfg = config::load(config_path)?;
-            let p = cfg
+            let mut pf = config::load_profiles(config_path)?;
+            let p = pf
                 .profiles
                 .get_mut(&profile)
                 .ok_or_else(|| anyhow::anyhow!("profile '{profile}' not found"))?;
@@ -462,15 +460,15 @@ fn cmd_profile(config_path: &std::path::Path, action: cli::ProfileCmd) -> Result
                 anyhow::bail!("no override for '{server}' in profile '{profile}'");
             }
 
-            config::save(config_path, &cfg)?;
+            config::save_profiles(config_path, &pf)?;
             eprintln!("✅ removed override for '{server}' from profile '{profile}'");
             Ok(())
         }
         ProfileCmd::Switch { name } => {
-            let cfg = config::load(config_path)?;
+            let pf = config::load_profiles(config_path)?;
             match name {
                 Some(ref n) => {
-                    if !cfg.profiles.contains_key(n.as_str()) {
+                    if !pf.profiles.contains_key(n.as_str()) {
                         anyhow::bail!("profile '{n}' not found");
                     }
                     config::write_active_profile(Some(n))?;

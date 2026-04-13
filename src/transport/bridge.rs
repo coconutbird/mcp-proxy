@@ -57,8 +57,8 @@ pub async fn run(
     let mut server_list: Vec<String> = servers.to_vec();
 
     if let Some(prof_name) = profile {
-        let cfg = crate::config::load(config_path)?;
-        if let Some(prof) = cfg.profiles.get(prof_name) {
+        let pf = crate::config::load_profiles(config_path)?;
+        if let Some(prof) = pf.profiles.get(prof_name) {
             // Profile include list (--servers takes priority)
             if server_list.is_empty() && !prof.include.is_empty() {
                 server_list = prof.include.clone();
