@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "mcp-hub",
+    name = "mcp-proxy",
     version,
     about = "MCP proxy that aggregates multiple MCP servers"
 )]
@@ -71,7 +71,7 @@ pub enum Cmd {
         #[arg(short, long, default_value_t = 3000)]
         port: u16,
     },
-    /// Remove mcp-hub from all clients
+    /// Remove mcp-proxy from all clients
     Uninstall,
     /// Check health of a running hub
     Health {

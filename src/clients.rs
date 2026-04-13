@@ -66,7 +66,7 @@ pub fn is_installed(client: &ClientDef) -> bool {
     read_config(client).is_some_and(|cfg| {
         cfg.get(client.mcp_key)
             .and_then(Value::as_object)
-            .is_some_and(|m| m.contains_key("mcp-hub"))
+            .is_some_and(|m| m.contains_key("mcp-proxy"))
     })
 }
 
@@ -136,7 +136,7 @@ pub fn install(
         .or_insert_with(|| serde_json::json!({}));
     let map = servers.as_object_mut().unwrap();
     map.insert(
-        "mcp-hub".into(),
+        "mcp-proxy".into(),
         mcp_entry(port, client, self_exe, profile, forward_env),
     );
     write_config(client, &cfg)?;
@@ -154,7 +154,7 @@ pub fn uninstall(client: &ClientDef) -> Result<bool> {
     else {
         return Ok(false);
     };
-    if servers.remove("mcp-hub").is_none() {
+    if servers.remove("mcp-proxy").is_none() {
         return Ok(false);
     }
     write_config(client, &cfg)?;

@@ -1,5 +1,5 @@
 [package]
-name = "mcp-hub"
+name = "mcp-proxy"
 version = "0.1.0"
 edition = "2024"
 description = "MCP proxy that aggregates multiple MCP servers into a single endpoint"

@@ -67,7 +67,7 @@ pub fn dockerfile(config: &Config, out: &Path) -> Result<()> {
         ));
     }
 
-    d.push_str("\nWORKDIR /app\nCOPY config/servers.json /app/config/servers.json\nCOPY mcp-hub /usr/local/bin/mcp-hub\n\nENV CONFIG_PATH=/app/config/servers.json\nENV MCP_TRANSPORT=http\nENV MCP_PORT=3000\n\nEXPOSE 3000\nCMD [\"mcp-hub\", \"serve\"]\n");
+    d.push_str("\nWORKDIR /app\nCOPY config/servers.json /app/config/servers.json\nCOPY mcp-proxy /usr/local/bin/mcp-proxy\n\nENV CONFIG_PATH=/app/config/servers.json\nENV MCP_TRANSPORT=http\nENV MCP_PORT=3000\n\nEXPOSE 3000\nCMD [\"mcp-proxy\", \"serve\"]\n");
 
     std::fs::write(out, d)?;
     eprintln!("wrote {}", out.display());

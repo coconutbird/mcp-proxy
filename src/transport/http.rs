@@ -179,7 +179,7 @@ async fn handle_request(
         "initialize" => Ok(serde_json::json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "mcp-hub", "version": env!("CARGO_PKG_VERSION") },
+            "serverInfo": { "name": "mcp-proxy", "version": env!("CARGO_PKG_VERSION") },
         })),
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {

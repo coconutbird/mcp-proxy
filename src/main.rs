@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("mcp_hub=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("mcp_proxy=info".parse()?))
         .with_writer(std::io::stderr)
         .init();
 
@@ -118,7 +118,7 @@ fn cmd_clients(port: u16, profile: Option<&str>) -> Result<()> {
 
     let defaults: Vec<bool> = available.iter().map(|c| clients::is_installed(c)).collect();
     let selections = dialoguer::MultiSelect::new()
-        .with_prompt("Select clients to install mcp-hub to")
+        .with_prompt("Select clients to install mcp-proxy to")
         .items(&labels)
         .defaults(&defaults)
         .interact()?;
@@ -142,7 +142,7 @@ fn cmd_clients(port: u16, profile: Option<&str>) -> Result<()> {
 }
 
 fn cmd_status() -> Result<()> {
-    eprintln!("\n📊 mcp-hub status\n");
+    eprintln!("\n📊 mcp-proxy status\n");
     for client in &clients::known_clients() {
         let avail = clients::is_available(client);
         let inst = avail && clients::is_installed(client);

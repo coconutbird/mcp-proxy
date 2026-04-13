@@ -69,7 +69,7 @@ async fn handle(hub: &Hub, method: &str, params: Value) -> Result<Value> {
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
             "serverInfo": {
-                "name": "mcp-hub",
+                "name": "mcp-proxy",
                 "version": env!("CARGO_PKG_VERSION"),
             },
         })),

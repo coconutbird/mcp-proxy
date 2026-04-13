@@ -298,11 +298,11 @@ pub fn list_profiles(cfg: &Config) -> Vec<(&str, Option<&str>)> {
 }
 
 // ---------------------------------------------------------------------------
-// Active profile persistence (~/.mcp-hub/active-profile)
+// Active profile persistence (~/.mcp-proxy/active-profile)
 // ---------------------------------------------------------------------------
 
 fn profile_state_path() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".mcp-hub")
+    dirs::home_dir().unwrap_or_default().join(".mcp-proxy")
 }
 
 pub fn read_active_profile() -> Option<String> {

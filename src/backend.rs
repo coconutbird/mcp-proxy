@@ -144,7 +144,7 @@ impl Backend {
             serde_json::json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": { "name": "mcp-hub", "version": env!("CARGO_PKG_VERSION") }
+                "clientInfo": { "name": "mcp-proxy", "version": env!("CARGO_PKG_VERSION") }
             }),
         )
         .await?;
