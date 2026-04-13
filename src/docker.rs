@@ -5,6 +5,8 @@
 //! inside a container with stdio piped.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
@@ -14,17 +16,6 @@ use crate::config::{ExtractMethod, InstallConfig, ServerConfig, expand_env_with_
 /// Docker image tag for a backend: `mcp-proxy/<name>`
 fn image_tag(name: &str) -> String {
     format!("mcp-proxy/{name}")
-}
-
-/// Check if a Docker image already exists locally.
-async fn image_exists(tag: &str) -> bool {
-    Command::new("docker")
-        .args(["image", "inspect", tag])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|s| s.success())
 }
 
 /// Generate a Dockerfile for a single backend.
@@ -105,18 +96,58 @@ fn generate_dockerfile(cfg: &ServerConfig) -> Option<String> {
     Some(d)
 }
 
-/// Build the Docker image for a backend if it doesn't already exist.
+const HASH_LABEL: &str = "mcp-proxy.config-hash";
+
+/// Hash the Dockerfile content to detect config changes.
+fn content_hash(dockerfile: &str) -> String {
+    let mut h = DefaultHasher::new();
+    dockerfile.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Read the config-hash label from an existing image (if any).
+async fn image_hash(tag: &str) -> Option<String> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            &format!("{{{{index .Config.Labels \"{HASH_LABEL}\"}}}}"),
+            tag,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Build the Docker image for a backend. Rebuilds if the config has changed.
 pub async fn ensure_image(name: &str, cfg: &ServerConfig) -> Result<()> {
     let tag = image_tag(name);
-
-    if image_exists(&tag).await {
-        return Ok(());
-    }
 
     let dockerfile =
         generate_dockerfile(cfg).ok_or_else(|| anyhow::anyhow!("no install config for {name}"))?;
 
+    let hash = content_hash(&dockerfile);
+
+    // Skip build if image exists with matching hash
+    if let Some(existing) = image_hash(&tag).await {
+        if existing == hash {
+            return Ok(());
+        }
+        eprintln!("  config changed for {name}, rebuilding...");
+    }
+
     eprintln!("  building docker image {tag}...");
+
+    // Inject the hash as a label so we can detect changes next time
+    let label_arg = format!("LABEL {HASH_LABEL}=\"{hash}\"");
+    let dockerfile_with_label = format!("{dockerfile}\n{label_arg}\n");
 
     let mut child = Command::new("docker")
         .args(["build", "-t", &tag, "-f", "-", "."])
@@ -126,11 +157,9 @@ pub async fn ensure_image(name: &str, cfg: &ServerConfig) -> Result<()> {
         .spawn()
         .context("failed to run 'docker build' — is Docker installed?")?;
 
-    // Feed the Dockerfile via stdin
     use tokio::io::AsyncWriteExt;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(dockerfile.as_bytes()).await?;
-        // stdin drops here, closing it
+        stdin.write_all(dockerfile_with_label.as_bytes()).await?;
     }
 
     let output = child.wait_with_output().await?;
