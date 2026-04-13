@@ -1,0 +1,66 @@
+{
+  "servers": {
+    "context7": {
+      "install": { "type": "npm", "package": "@upstash/context7-mcp" },
+      "command": "context7-mcp",
+      "envToggle": "ENABLE_CONTEXT7"
+    },
+    "sequential-thinking": {
+      "install": {
+        "type": "npm",
+        "package": "@modelcontextprotocol/server-sequential-thinking"
+      },
+      "command": "mcp-server-sequential-thinking",
+      "envToggle": "ENABLE_SEQUENTIAL_THINKING"
+    },
+    "github": {
+      "install": {
+        "type": "binary",
+        "url": "https://github.com/github/github-mcp-server/releases/latest/download/github-mcp-server_Linux_${ARCH}.tar.gz",
+        "extract": "tar",
+        "binary": "github-mcp-server"
+      },
+      "command": "github-mcp-server",
+      "args": ["stdio"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}" },
+      "envToggle": "ENABLE_GITHUB"
+    },
+    "memory": {
+      "install": {
+        "type": "npm",
+        "package": "@modelcontextprotocol/server-memory"
+      },
+      "command": "mcp-server-memory",
+      "envToggle": "ENABLE_MEMORY"
+    }
+  },
+  "customTools": {},
+  "profiles": {
+    "work": {
+      "description": "Work — corporate GitHub + Jira",
+      "include": ["github", "memory", "context7", "sequential-thinking"],
+      "servers": {
+        "github": {
+          "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN_WORK}" },
+          "args": ["stdio", "--org=mycompany"]
+        },
+        "jira": {
+          "command": "jira-mcp-server",
+          "env": { "JIRA_TOKEN": "${JIRA_TOKEN}" }
+        }
+      }
+    },
+    "home": {
+      "description": "Home — personal token, no Jira",
+      "servers": {
+        "github": {
+          "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN_PERSONAL}" }
+        }
+      }
+    },
+    "minimal": {
+      "description": "Lightweight — just memory and thinking",
+      "include": ["memory", "sequential-thinking"]
+    }
+  }
+}
