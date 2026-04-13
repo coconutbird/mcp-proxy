@@ -55,12 +55,12 @@ See [`config/servers.example.json`](config/servers.example.json) for a full exam
 
 Each server entry has:
 
-| Field       | Required | Description |
-|-------------|----------|-------------|
-| `command`   | yes      | Binary to run |
-| `args`      | no       | Command-line arguments |
-| `env`       | no       | Environment variables (`${VAR}` expanded from process env) |
-| `envToggle` | no       | Env var name — set to `false` to disable this server |
+| Field       | Required | Description                                                   |
+| ----------- | -------- | ------------------------------------------------------------- |
+| `command`   | yes      | Binary to run                                                 |
+| `args`      | no       | Command-line arguments                                        |
+| `env`       | no       | Environment variables (`${VAR}` expanded from process env)    |
+| `envToggle` | no       | Env var name — set to `false` to disable this server          |
 | `install`   | no       | Install method for Docker generation (`npm`, `pip`, `binary`) |
 
 ### Profiles
@@ -128,8 +128,13 @@ To forward local credentials to the remote server:
 ```json
 {
   "command": "mcp-proxy",
-  "args": ["bridge", "--url", "http://remote:3000/mcp",
-           "--forward-env", "GITHUB_TOKEN"],
+  "args": [
+    "bridge",
+    "--url",
+    "http://remote:3000/mcp",
+    "--forward-env",
+    "GITHUB_TOKEN"
+  ],
   "env": { "GITHUB_TOKEN": "ghp_my_token" }
 }
 ```
@@ -138,9 +143,9 @@ Each unique (profile + env) combination gets its own isolated backend pool on th
 
 ## Environment Variables
 
-| Variable        | Description |
-|-----------------|-------------|
-| `CONFIG_PATH`   | Path to servers.json |
-| `MCP_PROFILE`   | Default profile |
-| `MCP_PORT`      | HTTP port (default: 3000) |
+| Variable        | Description                       |
+| --------------- | --------------------------------- |
+| `CONFIG_PATH`   | Path to servers.json              |
+| `MCP_PROFILE`   | Default profile                   |
+| `MCP_PORT`      | HTTP port (default: 3000)         |
 | `MCP_TRANSPORT` | Transport mode: `http` or `stdio` |

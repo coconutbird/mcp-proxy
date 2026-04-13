@@ -9,7 +9,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
 use tracing::{info, warn};
 
-use crate::config::{ServerConfig, expand_env};
+use crate::config::{ServerConfig, expand_env_with_overrides};
 
 #[derive(serde::Serialize)]
 struct Rpc<'a> {
@@ -68,15 +68,20 @@ impl Backend {
         cfg: &ServerConfig,
         extra_env: &HashMap<String, String>,
     ) -> Result<Self> {
-        let args: Vec<String> = cfg.args.iter().map(|a| expand_env(a)).collect();
+        // Expand ${VAR} references against BOTH the hub's process env AND
+        // the client's forwarded env (client wins on conflict).
+        let expand = |s: &str| expand_env_with_overrides(s, extra_env);
+
+        let args: Vec<String> = cfg.args.iter().map(|a| expand(a)).collect();
         let mut env: HashMap<String, String> = cfg
             .env
             .iter()
-            .map(|(k, v)| (k.clone(), expand_env(v)))
+            .map(|(k, v)| (k.clone(), expand(v)))
             .collect();
-        // Layer client env overrides on top (they win over config values)
+        // Also inject the raw client overrides so backends that read env
+        // vars directly (not via config ${} refs) still get them.
         for (k, v) in extra_env {
-            env.insert(k.clone(), v.clone());
+            env.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
         let mut child = Command::new(&cfg.command)

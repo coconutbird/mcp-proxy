@@ -350,15 +350,18 @@ pub fn write_active_profile(profile: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Expand `${VAR}` references from the process environment.
-pub fn expand_env(s: &str) -> String {
+/// Expand `${VAR}` references, checking `overrides` first, then process env.
+pub fn expand_env_with_overrides(s: &str, overrides: &HashMap<String, String>) -> String {
     let mut out = s.to_string();
     while let Some(start) = out.find("${") {
         let Some(end) = out[start..].find('}') else {
             break;
         };
         let key = &out[start + 2..start + end];
-        let val = std::env::var(key).unwrap_or_default();
+        let val = overrides
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| std::env::var(key).unwrap_or_default());
         out = format!("{}{}{}", &out[..start], val, &out[start + end + 1..]);
     }
     out
