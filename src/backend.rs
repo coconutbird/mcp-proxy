@@ -62,13 +62,22 @@ pub struct Backend {
 
 impl Backend {
     /// Spawn the server process, complete the MCP handshake, discover tools.
-    pub async fn start(name: String, cfg: &ServerConfig) -> Result<Self> {
+    /// `extra_env` are per-client overrides that take precedence over config env.
+    pub async fn start(
+        name: String,
+        cfg: &ServerConfig,
+        extra_env: &HashMap<String, String>,
+    ) -> Result<Self> {
         let args: Vec<String> = cfg.args.iter().map(|a| expand_env(a)).collect();
-        let env: HashMap<String, String> = cfg
+        let mut env: HashMap<String, String> = cfg
             .env
             .iter()
             .map(|(k, v)| (k.clone(), expand_env(v)))
             .collect();
+        // Layer client env overrides on top (they win over config values)
+        for (k, v) in extra_env {
+            env.insert(k.clone(), v.clone());
+        }
 
         let mut child = Command::new(&cfg.command)
             .args(&args)

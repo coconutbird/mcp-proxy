@@ -4,14 +4,49 @@
 //! endpoint, and writes responses back to stdout. Optionally auto-starts
 //! the Docker container first.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
+use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::error;
 
+/// Collect env vars by name from the current process environment.
+fn collect_env_overrides(names: &[String]) -> HashMap<String, String> {
+    names
+        .iter()
+        .filter_map(|name| {
+            let val = std::env::var(name).ok()?;
+            Some((name.clone(), val))
+        })
+        .collect()
+}
+
+/// Encode env overrides as a base64 JSON header value.
+fn encode_env_header(env: &HashMap<String, String>) -> Option<String> {
+    if env.is_empty() {
+        return None;
+    }
+    let json = serde_json::to_string(env).ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(json))
+}
+
 /// Run the bridge, forwarding stdin → HTTP → stdout.
-pub async fn run(url: &str) -> Result<()> {
+/// `forward_env` lists env var names to read from the local process and
+/// send to the hub as an `X-MCP-Env` header.
+pub async fn run(url: &str, forward_env: &[String]) -> Result<()> {
     let client = reqwest::Client::new();
     let mut session_id: Option<String> = None;
+    let env_overrides = collect_env_overrides(forward_env);
+    let env_header = encode_env_header(&env_overrides);
+
+    if !env_overrides.is_empty() {
+        eprintln!(
+            "bridge forwarding {} env var(s): {}",
+            env_overrides.len(),
+            env_overrides.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
 
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -32,6 +67,10 @@ pub async fn run(url: &str) -> Result<()> {
 
         if let Some(ref sid) = session_id {
             req = req.header("mcp-session-id", sid);
+        }
+
+        if let Some(ref hdr) = env_header {
+            req = req.header("x-mcp-env", hdr);
         }
 
         match req.body(line).send().await {

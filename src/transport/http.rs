@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -16,6 +17,9 @@ use crate::server::Hub;
 
 struct Session {
     _id: String,
+    /// Per-client env overrides decoded from X-MCP-Env header.
+    #[allow(dead_code)]
+    env_overrides: HashMap<String, String>,
 }
 
 type Sessions = Arc<RwLock<HashMap<String, Session>>>;
@@ -25,6 +29,16 @@ struct AppState {
     hub: Arc<Hub>,
     sessions: Sessions,
     port: u16,
+}
+
+/// Decode the X-MCP-Env header: base64-encoded JSON map of env vars.
+fn decode_env_header(headers: &HeaderMap) -> HashMap<String, String> {
+    headers
+        .get("x-mcp-env")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(&bytes).ok())
+        .unwrap_or_default()
 }
 
 /// Start the Streamable-HTTP MCP server on the given port.
@@ -56,23 +70,33 @@ async fn handle_mcp(
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> Response {
+    // Decode per-client env overrides from X-MCP-Env header
+    let env_overrides = decode_env_header(&headers);
+
     // Resolve or create session
-    let session_id = headers
+    let session_id = match headers
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
-        .unwrap_or_else(|| {
+    {
+        Some(id) => id,
+        None => {
             let id = Uuid::new_v4().to_string();
-            let id_ret = id.clone();
+            let id_clone = id.clone();
+            let env_clone = env_overrides.clone();
             let sessions = state.sessions.clone();
             tokio::spawn(async move {
-                sessions
-                    .write()
-                    .await
-                    .insert(id.clone(), Session { _id: id });
+                sessions.write().await.insert(
+                    id.clone(),
+                    Session {
+                        _id: id,
+                        env_overrides: env_clone,
+                    },
+                );
             });
-            id_ret
-        });
+            id_clone
+        }
+    };
 
     let method = req
         .get("method")
@@ -82,7 +106,7 @@ async fn handle_mcp(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let id = req.get("id").cloned();
 
-    let result = handle_request(&state.hub, &method, params).await;
+    let result = handle_request(&state.hub, &method, params, &env_overrides).await;
 
     // Notifications (no id) get 202 Accepted
     let Some(req_id) = id else {
@@ -122,7 +146,12 @@ async fn handle_health(State(state): State<AppState>) -> Json<Value> {
     Json(health)
 }
 
-async fn handle_request(hub: &Hub, method: &str, params: Value) -> anyhow::Result<Value> {
+async fn handle_request(
+    hub: &Hub,
+    method: &str,
+    params: Value,
+    env_overrides: &HashMap<String, String>,
+) -> anyhow::Result<Value> {
     match method {
         "initialize" => Ok(serde_json::json!({
             "protocolVersion": "2024-11-05",
@@ -131,7 +160,7 @@ async fn handle_request(hub: &Hub, method: &str, params: Value) -> anyhow::Resul
         })),
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
-            let tools = hub.list_tools().await;
+            let tools = hub.list_tools_with_env(env_overrides).await;
             Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -140,7 +169,7 @@ async fn handle_request(hub: &Hub, method: &str, params: Value) -> anyhow::Resul
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-            hub.call_tool(name, args).await
+            hub.call_tool_with_env(name, args, env_overrides).await
         }
         _ => anyhow::bail!("unsupported method: {method}"),
     }

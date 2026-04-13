@@ -44,6 +44,11 @@ pub enum Cmd {
         /// Profile override (passed by client config)
         #[arg(long)]
         profile: Option<String>,
+        /// Comma-separated env var names to forward to the hub.
+        /// The bridge reads these from its own process env and sends
+        /// them as X-MCP-Env header so the hub can apply them to backends.
+        #[arg(long, value_delimiter = ',')]
+        forward_env: Vec<String>,
     },
     /// Generate Dockerfile and .env.example from config
     Generate {

@@ -35,6 +35,7 @@ dirs = "6"
 
 # Interactive prompts (for client selection)
 dialoguer = "0.11"
+base64 = "0.22.1"
 
 [profile.release]
 opt-level = 3

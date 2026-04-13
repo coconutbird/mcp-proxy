@@ -32,7 +32,9 @@ async fn main() -> Result<()> {
         cli::Cmd::Serve { transport, port } => {
             cmd_serve(&args.config, profile.as_deref(), &transport, port).await
         }
-        cli::Cmd::Bridge { url, .. } => transport::bridge::run(&url).await,
+        cli::Cmd::Bridge {
+            url, forward_env, ..
+        } => transport::bridge::run(&url, &forward_env).await,
         cli::Cmd::Generate { target, dir } => {
             cmd_generate(&args.config, profile.as_deref(), &target, &dir)
         }
@@ -122,7 +124,7 @@ fn cmd_clients(port: u16, profile: Option<&str>) -> Result<()> {
     for (i, client) in available.iter().enumerate() {
         if selected_set.contains(&i) {
             if !clients::is_installed(client) {
-                clients::install(client, port, &self_exe, profile)?;
+                clients::install(client, port, &self_exe, profile, &[])?;
                 eprintln!("  ✅ installed to {}", client.name);
             }
         } else if clients::is_installed(client) {
@@ -157,7 +159,7 @@ fn cmd_sync(port: u16, profile: Option<&str>) -> Result<()> {
         if !clients::is_installed(client) {
             continue;
         }
-        clients::install(client, port, &self_exe, profile)?;
+        clients::install(client, port, &self_exe, profile, &[])?;
         eprintln!("  🔧 synced {}", client.name);
     }
     Ok(())

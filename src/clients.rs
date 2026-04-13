@@ -71,13 +71,19 @@ pub fn is_installed(client: &ClientDef) -> bool {
 }
 
 /// Build the MCP server entry to write into a client config.
-pub fn mcp_entry(port: u16, client: &ClientDef, self_exe: &str, profile: Option<&str>) -> Value {
-    if client.supports_http {
-        serde_json::json!({
-            "type": "http",
-            "url": format!("http://localhost:{port}/mcp"),
-        })
-    } else {
+/// `forward_env` lists env var names the client should set locally and
+/// forward to the hub via the bridge. When non-empty, we always use
+/// the bridge (stdio) so the env vars can be sent as headers.
+pub fn mcp_entry(
+    port: u16,
+    client: &ClientDef,
+    self_exe: &str,
+    profile: Option<&str>,
+    forward_env: &[String],
+) -> Value {
+    let use_bridge = !client.supports_http || !forward_env.is_empty();
+
+    if use_bridge {
         let mut args = vec![
             "bridge".to_string(),
             "--url".to_string(),
@@ -86,10 +92,31 @@ pub fn mcp_entry(port: u16, client: &ClientDef, self_exe: &str, profile: Option<
         if let Some(p) = profile {
             args.extend(["--profile".into(), p.into()]);
         }
-        serde_json::json!({
+        if !forward_env.is_empty() {
+            args.push("--forward-env".into());
+            args.push(forward_env.join(","));
+        }
+        let mut entry = serde_json::json!({
             "type": "stdio",
             "command": self_exe,
             "args": args,
+        });
+        // Put env var placeholders so the user knows what to fill in
+        if !forward_env.is_empty() {
+            let env_obj: serde_json::Map<String, Value> = forward_env
+                .iter()
+                .map(|k| (k.clone(), Value::String(format!("${{YOUR_{k}}}"))))
+                .collect();
+            entry
+                .as_object_mut()
+                .unwrap()
+                .insert("env".into(), Value::Object(env_obj));
+        }
+        entry
+    } else {
+        serde_json::json!({
+            "type": "http",
+            "url": format!("http://localhost:{port}/mcp"),
         })
     }
 }
@@ -99,6 +126,7 @@ pub fn install(
     port: u16,
     self_exe: &str,
     profile: Option<&str>,
+    forward_env: &[String],
 ) -> Result<bool> {
     let mut cfg = read_config(client).unwrap_or_else(|| serde_json::json!({ client.mcp_key: {} }));
     let servers = cfg
@@ -107,7 +135,10 @@ pub fn install(
         .entry(client.mcp_key)
         .or_insert_with(|| serde_json::json!({}));
     let map = servers.as_object_mut().unwrap();
-    map.insert("mcp-hub".into(), mcp_entry(port, client, self_exe, profile));
+    map.insert(
+        "mcp-hub".into(),
+        mcp_entry(port, client, self_exe, profile, forward_env),
+    );
     write_config(client, &cfg)?;
     Ok(true)
 }
