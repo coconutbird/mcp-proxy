@@ -22,7 +22,7 @@ use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{Backend, Tool};
-use crate::config::{Config, ServerConfig, Sharing, is_toggled_off};
+use crate::config::{Config, ServerConfig, Sharing, diff_fields, is_toggled_off};
 use crate::custom_tools::CustomTools;
 
 // ---------------------------------------------------------------------------
@@ -125,18 +125,21 @@ struct BackendEntry {
     last_used: Option<Instant>,
 }
 
+impl BackendEntry {
+    /// Wrap a backend in an entry. `reapable = true` starts the idle timer;
+    /// `false` means the instance is never reaped (e.g. Global sharing).
+    fn new(backend: Backend, reapable: bool) -> Self {
+        Self {
+            backend: Arc::new(tokio::sync::Mutex::new(backend)),
+            last_used: if reapable { Some(Instant::now()) } else { None },
+        }
+    }
+}
+
 /// Composite key: server name + hash of only the env vars that server cares about.
 type BackendKey = (String, String);
 
-/// FNV-1a 64-bit hash — deterministic across Rust versions (unlike DefaultHasher).
-fn stable_hash(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
+use crate::util::fnv1a;
 
 /// Extract the `${VAR}` references from a server config's env values and args.
 pub fn relevant_env_keys(srv: &ServerConfig) -> Vec<String> {
@@ -186,7 +189,7 @@ fn backend_env_key(srv: &ServerConfig, env_overrides: &HashMap<String, String>) 
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("\0");
-    format!("{ENV_KEY_PREFIX}{:x}", stable_hash(&s))
+    format!("{ENV_KEY_PREFIX}{:x}", fnv1a(&s))
 }
 
 /// Compute the env-key portion of a backend key based on sharing mode.
@@ -205,6 +208,8 @@ fn sharing_env_key(
 /// The aggregator: holds individual backend instances keyed by
 /// (server_name, relevant_env_hash). Two clients that share the same
 /// credentials for a given server will reuse the same backend process.
+type SpawnLocks = Arc<TokioMutex<HashMap<BackendKey, Arc<TokioMutex<()>>>>>;
+
 pub struct Hub {
     raw_config: Arc<RwLock<Config>>,
     /// Individual backend instances keyed by (name, env_hash).
@@ -214,7 +219,7 @@ pub struct Hub {
     /// Guards the check-then-insert path in `ensure_backend` so that
     /// two concurrent requests for the same un-spawned backend don't
     /// both spawn a process (TOCTOU race).
-    spawn_locks: TokioMutex<HashMap<BackendKey, Arc<TokioMutex<()>>>>,
+    spawn_locks: SpawnLocks,
 }
 
 impl Hub {
@@ -281,13 +286,7 @@ impl Hub {
         for handle in handles {
             match handle.await {
                 Ok(Ok((name, env_key, be))) => {
-                    backends.insert(
-                        (name, env_key),
-                        BackendEntry {
-                            backend: Arc::new(tokio::sync::Mutex::new(be)),
-                            last_used: None,
-                        },
-                    );
+                    backends.insert((name, env_key), BackendEntry::new(be, false));
                 }
                 Ok(Err((name, e))) => {
                     error!(server = %name, "startup failed: {e}");
@@ -310,10 +309,13 @@ impl Hub {
         let raw_config = Arc::new(RwLock::new(raw_config));
         let backends = Arc::new(RwLock::new(backends));
 
+        let spawn_locks: SpawnLocks = Arc::new(TokioMutex::new(HashMap::new()));
+
         // Background reaper: every 60s, kill instances idle > their configured timeout.
         // Uses the shared Arc<RwLock<Config>> so hot-reloaded timeouts take effect.
         let reaper_backends = backends.clone();
         let reaper_config = raw_config.clone();
+        let reaper_locks = spawn_locks.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -338,10 +340,17 @@ impl Hub {
                     })
                     .collect();
                 drop(cfg);
-                for key in stale {
-                    if let Some(entry) = map.remove(&key) {
+                for key in &stale {
+                    if let Some(entry) = map.remove(key) {
                         entry.backend.lock().await.kill();
                         info!(server = %key.0, scope = %key.1, "reaped idle backend");
+                    }
+                }
+                // Purge spawn-lock entries for reaped keys to prevent unbounded growth.
+                if !stale.is_empty() {
+                    let mut locks = reaper_locks.lock().await;
+                    for key in &stale {
+                        locks.remove(key);
                     }
                 }
             }
@@ -351,7 +360,7 @@ impl Hub {
             raw_config,
             backends,
             custom: RwLock::new(custom),
-            spawn_locks: TokioMutex::new(HashMap::new()),
+            spawn_locks,
         })
     }
 
@@ -432,20 +441,9 @@ impl Hub {
         info!("spawning backend {name} ({env_key})");
         let backend = Backend::start(name.to_string(), &srv, env_overrides).await?;
 
-        // Global backends are never reaped; others have an idle timer.
-        let last_used = match srv.shared {
-            Sharing::Global => None,
-            _ => Some(Instant::now()),
-        };
-
+        let reapable = !matches!(srv.shared, Sharing::Global);
         let mut map = self.backends.write().await;
-        map.insert(
-            key.clone(),
-            BackendEntry {
-                backend: Arc::new(tokio::sync::Mutex::new(backend)),
-                last_used,
-            },
-        );
+        map.insert(key.clone(), BackendEntry::new(backend, reapable));
         Ok(key)
     }
 
@@ -460,12 +458,7 @@ impl Hub {
     ) -> Vec<(String, String)> {
         let cfg = self.raw_config.read().await;
         let names: Vec<String> = if servers.is_empty() {
-            cfg.servers
-                .keys()
-                .filter(|n| !n.starts_with('_'))
-                .filter(|n| !is_toggled_off(cfg.servers[*n].env_toggle.as_deref()))
-                .cloned()
-                .collect()
+            cfg.active_server_names()
         } else {
             servers.to_vec()
         };
@@ -562,12 +555,7 @@ impl Hub {
         let names: Vec<String> = {
             let cfg = self.raw_config.read().await;
             if servers.is_empty() {
-                cfg.servers
-                    .keys()
-                    .filter(|n| !n.starts_with('_'))
-                    .filter(|n| !is_toggled_off(cfg.servers[*n].env_toggle.as_deref()))
-                    .cloned()
-                    .collect()
+                cfg.active_server_names()
             } else {
                 servers.to_vec()
             }
@@ -757,10 +745,10 @@ impl Hub {
                 "global"
             } else if env_key.starts_with(ENV_KEY_PREFIX) {
                 "credentials"
+            } else if env_key.starts_with(SESSION_KEY_PREFIX) {
+                session_count += 1;
+                "session"
             } else {
-                if env_key.starts_with(SESSION_KEY_PREFIX) {
-                    session_count += 1;
-                }
                 "session"
             };
             let be = entry.backend.lock().await;
@@ -794,6 +782,13 @@ impl Hub {
             if let Some(entry) = map.remove(key) {
                 info!("cleaning up {} for session {session_id}", key.0);
                 entry.backend.lock().await.kill();
+            }
+        }
+        // Purge spawn-lock entries for removed session backends.
+        if !stale.is_empty() {
+            let mut locks = self.spawn_locks.lock().await;
+            for key in &stale {
+                locks.remove(key);
             }
         }
     }
@@ -840,50 +835,7 @@ impl Hub {
                 match new_servers.get(name) {
                     None => remove.push(name.clone()),
                     Some(new_srv) if *old_srv != *new_srv => {
-                        // Log what specifically changed for this server
-                        let mut changes = Vec::new();
-                        if old_srv.command != new_srv.command {
-                            changes.push("command");
-                        }
-                        if old_srv.args != new_srv.args {
-                            changes.push("args");
-                        }
-                        if old_srv.env != new_srv.env {
-                            changes.push("env");
-                        }
-                        if old_srv.shared != new_srv.shared {
-                            changes.push("shared");
-                        }
-                        if old_srv.install != new_srv.install {
-                            changes.push("install");
-                        }
-                        if old_srv.runtime != new_srv.runtime {
-                            changes.push("runtime");
-                        }
-                        if old_srv.timeout_secs != new_srv.timeout_secs {
-                            changes.push("timeout");
-                        }
-                        if old_srv.idle_timeout_secs != new_srv.idle_timeout_secs {
-                            changes.push("idle_timeout");
-                        }
-                        if old_srv.include_tools != new_srv.include_tools {
-                            changes.push("include_tools");
-                        }
-                        if old_srv.exclude_tools != new_srv.exclude_tools {
-                            changes.push("exclude_tools");
-                        }
-                        if old_srv.tool_aliases != new_srv.tool_aliases {
-                            changes.push("tool_aliases");
-                        }
-                        if old_srv.env_toggle != new_srv.env_toggle {
-                            changes.push("env_toggle");
-                        }
-                        if old_srv.auto_restart != new_srv.auto_restart {
-                            changes.push("auto_restart");
-                        }
-                        if old_srv.max_restarts != new_srv.max_restarts {
-                            changes.push("max_restarts");
-                        }
+                        let changes = diff_fields(old_srv, new_srv);
                         info!(
                             server = %name,
                             fields = %changes.join(", "),
@@ -926,11 +878,13 @@ impl Hub {
         let mut map = self.backends.write().await;
 
         // 1. Remove deleted servers (kill all scopes)
+        let mut removed_keys = Vec::new();
         for name in &to_remove {
             let keys: Vec<BackendKey> = map.keys().filter(|(n, _)| n == name).cloned().collect();
             for key in keys {
                 if let Some(entry) = map.remove(&key) {
                     entry.backend.lock().await.kill();
+                    removed_keys.push(key);
                 }
             }
             info!(server = %name, "removed");
@@ -941,6 +895,7 @@ impl Hub {
             let default_key = (name.clone(), DEFAULT_ENV_KEY.to_string());
             if let Some(entry) = map.remove(&default_key) {
                 entry.backend.lock().await.kill();
+                removed_keys.push(default_key);
             }
             let Some(srv) = new_servers.get(name) else {
                 continue;
@@ -956,13 +911,7 @@ impl Hub {
             match Backend::start(name.clone(), srv, &empty_env).await {
                 Ok(be) => {
                     let env_key = backend_env_key(srv, &empty_env);
-                    map.insert(
-                        (name.clone(), env_key),
-                        BackendEntry {
-                            backend: Arc::new(tokio::sync::Mutex::new(be)),
-                            last_used: None,
-                        },
-                    );
+                    map.insert((name.clone(), env_key), BackendEntry::new(be, false));
                 }
                 Err(e) => error!(server = %name, "restart failed: {e}"),
             }
@@ -984,19 +933,21 @@ impl Hub {
             match Backend::start(name.clone(), srv, &empty_env).await {
                 Ok(be) => {
                     let env_key = backend_env_key(srv, &empty_env);
-                    map.insert(
-                        (name.clone(), env_key),
-                        BackendEntry {
-                            backend: Arc::new(tokio::sync::Mutex::new(be)),
-                            last_used: None,
-                        },
-                    );
+                    map.insert((name.clone(), env_key), BackendEntry::new(be, false));
                 }
                 Err(e) => error!(server = %name, "start failed: {e}"),
             }
         }
 
         drop(map);
+
+        // Purge spawn-lock entries for removed/restarted backends.
+        if !removed_keys.is_empty() {
+            let mut locks = self.spawn_locks.lock().await;
+            for key in &removed_keys {
+                locks.remove(key);
+            }
+        }
 
         // 4. Update custom tools if changed
         if custom_changed {
@@ -1125,11 +1076,5 @@ mod tests {
         let key_without = backend_env_key(&srv, &env2);
 
         assert_eq!(key_with, key_without);
-    }
-
-    #[test]
-    fn stable_hash_deterministic() {
-        assert_eq!(stable_hash("hello"), stable_hash("hello"));
-        assert_ne!(stable_hash("hello"), stable_hash("world"));
     }
 }

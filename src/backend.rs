@@ -493,3 +493,46 @@ impl Drop for Backend {
         self.kill();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_exact_match() {
+        assert!(glob_match("read_file", "read_file"));
+        assert!(!glob_match("read_file", "write_file"));
+    }
+
+    #[test]
+    fn glob_star_prefix() {
+        assert!(glob_match("*_file", "read_file"));
+        assert!(glob_match("*_file", "write_file"));
+        assert!(!glob_match("*_file", "read_dir"));
+    }
+
+    #[test]
+    fn glob_star_suffix() {
+        assert!(glob_match("read_*", "read_file"));
+        assert!(glob_match("read_*", "read_dir"));
+        assert!(!glob_match("read_*", "write_file"));
+    }
+
+    #[test]
+    fn glob_star_middle() {
+        assert!(glob_match("read_*_v2", "read_file_v2"));
+        assert!(!glob_match("read_*_v2", "read_file_v3"));
+    }
+
+    #[test]
+    fn glob_star_only() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn glob_double_star() {
+        assert!(glob_match("a*b*c", "aXbYc"));
+        assert!(!glob_match("a*b*c", "aXbY"));
+    }
+}

@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
 use crate::config::{ExtractMethod, InstallConfig, ServerConfig, expand_env_with_overrides};
+use crate::util::fnv1a;
 
 /// Simple random u32 using FNV-1a hash of current instant + thread id.
 fn rand_u32() -> u32 {
@@ -20,12 +21,7 @@ fn rand_u32() -> u32 {
         std::time::Instant::now(),
         std::thread::current().id()
     );
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in seed.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h as u32
+    fnv1a(&seed) as u32
 }
 
 /// Docker image tag for a backend: `mcp-proxy/<name>`
@@ -116,12 +112,7 @@ const HASH_LABEL: &str = "mcp-proxy.config-hash";
 /// Hash the Dockerfile content to detect config changes.
 /// Uses FNV-1a for determinism across Rust compiler versions.
 fn content_hash(dockerfile: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in dockerfile.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", h)
+    format!("{:016x}", fnv1a(dockerfile))
 }
 
 /// Read the config-hash label from an existing image (if any).

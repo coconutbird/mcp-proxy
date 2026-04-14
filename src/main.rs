@@ -12,6 +12,7 @@ mod custom_tools;
 mod docker;
 mod server;
 mod transport;
+mod util;
 
 use anyhow::Result;
 use clap::Parser;

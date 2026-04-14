@@ -187,7 +187,12 @@ pub async fn run(
                     .contains("text/event-stream");
 
                 if is_sse {
-                    // Stream SSE chunks as they arrive
+                    // Simplified SSE parser: we only look for `data:` lines and
+                    // ignore `event:`, `id:`, and `retry:` fields. This is
+                    // sufficient because the MCP HTTP+SSE transport only emits
+                    // `data:` lines with JSON payloads (no multi-line data
+                    // fields or named event types). If the upstream spec ever
+                    // uses those features, this parser will need updating.
                     let mut buf = String::new();
                     while let Some(chunk) = resp.chunk().await? {
                         buf.push_str(&String::from_utf8_lossy(&chunk));

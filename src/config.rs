@@ -269,6 +269,17 @@ pub struct Config {
     pub custom_tools: HashMap<String, CustomToolConfig>,
 }
 
+impl Config {
+    /// Return server names that are active (not `_`-prefixed, not toggled off).
+    pub fn active_server_names(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .filter(|(n, srv)| !n.starts_with('_') && !is_toggled_off(srv.env_toggle.as_deref()))
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+}
+
 /// Load and parse the servers config file.
 pub fn load(path: &Path) -> Result<Config> {
     let raw =
@@ -424,6 +435,33 @@ pub fn is_toggled_off_with(
     })
 }
 
+/// Compare two `Serialize` structs and return the list of top-level JSON
+/// field names whose values differ. Automatically covers all fields —
+/// no manual per-field comparison needed, so new fields are picked up
+/// for free.
+pub fn diff_fields<T: serde::Serialize>(old: &T, new: &T) -> Vec<String> {
+    let to_map = |v: &T| -> Option<serde_json::Map<String, Value>> {
+        serde_json::to_value(v).ok()?.as_object().cloned()
+    };
+    let (Some(a), Some(b)) = (to_map(old), to_map(new)) else {
+        return vec!["(non-object)".into()];
+    };
+    let mut changed = Vec::new();
+    for (key, old_val) in &a {
+        match b.get(key) {
+            Some(new_val) if new_val != old_val => changed.push(key.clone()),
+            None => changed.push(key.clone()),
+            _ => {}
+        }
+    }
+    for key in b.keys() {
+        if !a.contains_key(key) {
+            changed.push(key.clone());
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,9 +491,10 @@ mod tests {
 
     #[test]
     fn expand_env_missing_var_is_empty() {
-        // Ensure the var doesn't exist in process env
-        unsafe { std::env::remove_var("__TEST_MISSING_VAR__") };
-        let out = expand_env_with_overrides("${__TEST_MISSING_VAR__}", &HashMap::new());
+        // Use expand_vars with a resolver that always returns None to
+        // avoid touching the process environment (which is unsafe in
+        // multi-threaded test runners).
+        let out = expand_vars("${NONEXISTENT}", |_| None);
         assert_eq!(out, "");
     }
 
@@ -496,5 +535,52 @@ mod tests {
         assert_eq!(s, Sharing::Credentials);
         let back = serde_json::to_string(&s).unwrap();
         assert_eq!(back, json);
+    }
+
+    fn test_srv_config(command: &str) -> ServerConfig {
+        ServerConfig {
+            install: None,
+            runtime: Runtime::default(),
+            command: command.into(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            env_toggle: None,
+            shared: Sharing::default(),
+            timeout_secs: None,
+            idle_timeout_secs: None,
+            auto_restart: true,
+            max_restarts: None,
+            include_tools: Vec::new(),
+            exclude_tools: Vec::new(),
+            tool_aliases: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn diff_fields_detects_changes() {
+        let a = test_srv_config("node");
+        let mut b = a.clone();
+        b.command = "python".into();
+        b.args = vec!["main.py".into()];
+
+        let mut changed = diff_fields(&a, &b);
+        changed.sort();
+        assert_eq!(changed, vec!["args", "command"]);
+    }
+
+    #[test]
+    fn diff_fields_no_changes() {
+        let a = test_srv_config("node");
+        let changes = diff_fields(&a, &a);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn diff_fields_new_field_value() {
+        let a = test_srv_config("node");
+        let mut b = a.clone();
+        b.timeout_secs = Some(30);
+        let changed = diff_fields(&a, &b);
+        assert!(changed.contains(&"timeoutSecs".to_string()));
     }
 }
