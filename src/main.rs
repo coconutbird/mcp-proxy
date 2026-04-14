@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
         }
         cli::Cmd::Server { action } => cmd_server(&args.config, action),
         cli::Cmd::Profile { action } => cmd_profile(&args.config, action),
-        cli::Cmd::Clients { port } => cmd_clients(port, profile.as_deref()),
+        cli::Cmd::Clients => cmd_clients(profile.as_deref()),
         cli::Cmd::Health { port } => cmd_health(port).await,
         cli::Cmd::Init => cmd_init(&args.config),
     }
@@ -88,7 +88,7 @@ async fn cmd_serve(
     }
 }
 
-fn cmd_clients(port: u16, profile: Option<&str>) -> Result<()> {
+fn cmd_clients(profile: Option<&str>) -> Result<()> {
     let all = clients::known_clients();
     let available: Vec<_> = all.iter().filter(|c| clients::is_available(c)).collect();
     if available.is_empty() {
@@ -121,7 +121,7 @@ fn cmd_clients(port: u16, profile: Option<&str>) -> Result<()> {
     for (i, client) in available.iter().enumerate() {
         if selected_set.contains(&i) {
             let was_installed = clients::is_installed(client);
-            clients::install(client, port, &self_exe, profile, &[])?;
+            clients::install(client, &self_exe, profile, &[])?;
             if was_installed {
                 eprintln!("  🔄 synced {}", client.name);
             } else {

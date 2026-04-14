@@ -8,8 +8,6 @@ pub struct ClientDef {
     pub name: &'static str,
     pub config_path: PathBuf,
     pub mcp_key: &'static str,
-    /// Whether this client supports HTTP transport natively.
-    pub supports_http: bool,
 }
 
 pub fn known_clients() -> Vec<ClientDef> {
@@ -26,19 +24,16 @@ pub fn known_clients() -> Vec<ClientDef> {
                 _ => home.join(".config/Claude/claude_desktop_config.json"),
             },
             mcp_key: "mcpServers",
-            supports_http: false,
         },
         ClientDef {
             name: "Claude CLI",
             config_path: home.join(".claude.json"),
             mcp_key: "mcpServers",
-            supports_http: true,
         },
         ClientDef {
             name: "Augment",
             config_path: home.join(".augment/settings.json"),
             mcp_key: "mcpServers",
-            supports_http: true,
         },
     ]
 }
@@ -71,59 +66,43 @@ pub fn is_installed(client: &ClientDef) -> bool {
 }
 
 /// Build the MCP server entry to write into a client config.
-/// `forward_env` lists env var names the client should set locally and
-/// forward to the hub via the bridge. When non-empty, we always use
-/// the bridge (stdio) so the env vars can be sent as headers.
+/// Always uses the bridge (stdio) so session lifecycle, env forwarding,
+/// and clean disconnect all work correctly.
 pub fn mcp_entry(
-    port: u16,
-    client: &ClientDef,
+    _client: &ClientDef,
     self_exe: &str,
     profile: Option<&str>,
     forward_env: &[String],
 ) -> Value {
-    let use_bridge = !client.supports_http || !forward_env.is_empty();
-
-    if use_bridge {
-        let mut args = vec![
-            "bridge".to_string(),
-            "--url".to_string(),
-            format!("http://localhost:{port}/mcp"),
-        ];
-        if let Some(p) = profile {
-            args.extend(["--profile".into(), p.into()]);
-        }
-        if !forward_env.is_empty() {
-            args.push("--forward-env".into());
-            args.push(forward_env.join(","));
-        }
-        let mut entry = serde_json::json!({
-            "type": "stdio",
-            "command": self_exe,
-            "args": args,
-        });
-        // Put env var placeholders so the user knows what to fill in
-        if !forward_env.is_empty() {
-            let env_obj: serde_json::Map<String, Value> = forward_env
-                .iter()
-                .map(|k| (k.clone(), Value::String(format!("${{YOUR_{k}}}"))))
-                .collect();
-            entry
-                .as_object_mut()
-                .unwrap()
-                .insert("env".into(), Value::Object(env_obj));
-        }
-        entry
-    } else {
-        serde_json::json!({
-            "type": "http",
-            "url": format!("http://localhost:{port}/mcp"),
-        })
+    let mut args = vec!["bridge".to_string()];
+    if let Some(p) = profile {
+        args.extend(["--profile".into(), p.into()]);
     }
+    if !forward_env.is_empty() {
+        args.push("--forward-env".into());
+        args.push(forward_env.join(","));
+    }
+    let mut entry = serde_json::json!({
+        "type": "stdio",
+        "command": self_exe,
+        "args": args,
+    });
+    // Put env var placeholders so the user knows what to fill in
+    if !forward_env.is_empty() {
+        let env_obj: serde_json::Map<String, Value> = forward_env
+            .iter()
+            .map(|k| (k.clone(), Value::String(format!("${{YOUR_{k}}}"))))
+            .collect();
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert("env".into(), Value::Object(env_obj));
+    }
+    entry
 }
 
 pub fn install(
     client: &ClientDef,
-    port: u16,
     self_exe: &str,
     profile: Option<&str>,
     forward_env: &[String],
@@ -137,7 +116,7 @@ pub fn install(
     let map = servers.as_object_mut().unwrap();
     map.insert(
         "mcp-proxy".into(),
-        mcp_entry(port, client, self_exe, profile, forward_env),
+        mcp_entry(client, self_exe, profile, forward_env),
     );
     write_config(client, &cfg)?;
     Ok(true)

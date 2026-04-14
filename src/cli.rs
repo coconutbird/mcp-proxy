@@ -56,11 +56,8 @@ pub enum Cmd {
         #[command(subcommand)]
         action: ProfileCmd,
     },
-    /// Interactive: select which clients to install to
-    Clients {
-        #[arg(short, long, default_value_t = 3000)]
-        port: u16,
-    },
+    /// Install/sync mcp-proxy to editor clients
+    Clients,
     /// Check health of a running hub
     Health {
         #[arg(short, long, default_value_t = 3000)]
