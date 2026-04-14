@@ -147,6 +147,19 @@ impl Hub {
             }
         }
 
+        // Pre-build Docker images for deferred servers so first connect is fast.
+        for (name, srv) in &raw_config.servers {
+            if name.starts_with('_') || backends.contains_key(&(name.clone(), String::new())) {
+                continue;
+            }
+            if srv.install.is_some() && matches!(srv.runtime, crate::config::Runtime::Docker) {
+                eprintln!("  pre-building docker image for {name}");
+                if let Err(e) = crate::docker::ensure_image(name, srv).await {
+                    eprintln!("  docker pre-build failed for {name}: {e}");
+                }
+            }
+        }
+
         let custom = Arc::new(CustomTools::new(&raw_config.custom_tools));
         let backends = Arc::new(RwLock::new(backends));
 
@@ -385,13 +398,35 @@ impl Hub {
                 serde_json::json!({
                     "name": name,
                     "env_key": env_key,
+                    "sharing": self.raw_config.servers.get(name)
+                        .map(|s| format!("{:?}", s.shared).to_lowercase())
+                        .unwrap_or_default(),
                     "ready": entry.backend.ready,
                     "tools": entry.backend.tools.len(),
                     "idle_secs": entry.last_used.map(|t| t.elapsed().as_secs()),
                 })
             })
             .collect();
-        serde_json::json!({ "backends": entries })
+
+        // Group backends by session
+        let mut sessions: HashMap<String, Vec<String>> = HashMap::new();
+        for ((name, env_key), _) in map.iter() {
+            if let Some(sid) = env_key.strip_prefix("session:") {
+                sessions
+                    .entry(sid.to_string())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+        let session_entries: Vec<Value> = sessions
+            .into_iter()
+            .map(|(sid, backends)| serde_json::json!({ "id": sid, "backends": backends }))
+            .collect();
+
+        serde_json::json!({
+            "backends": entries,
+            "active_sessions": session_entries,
+        })
     }
 
     /// Kill all backends belonging to a specific session.
@@ -417,5 +452,123 @@ impl Hub {
         for entry in map.values_mut() {
             entry.backend.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Runtime, Sharing};
+
+    /// Build a minimal ServerConfig for testing.
+    fn test_srv(env: Vec<(&str, &str)>, args: Vec<&str>, sharing: Sharing) -> ServerConfig {
+        ServerConfig {
+            install: None,
+            runtime: Runtime::default(),
+            command: "echo".into(),
+            args: args.into_iter().map(String::from).collect(),
+            env: env
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            env_toggle: None,
+            shared: sharing,
+        }
+    }
+
+    #[test]
+    fn extract_var_refs_basic() {
+        let mut out = Vec::new();
+        extract_var_refs("--token=${TOKEN}", &mut out);
+        assert_eq!(out, vec!["TOKEN"]);
+    }
+
+    #[test]
+    fn extract_var_refs_multiple() {
+        let mut out = Vec::new();
+        extract_var_refs("${A}_${B}_plain", &mut out);
+        assert_eq!(out, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn extract_var_refs_none() {
+        let mut out = Vec::new();
+        extract_var_refs("no vars here", &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn relevant_env_keys_deduplicates() {
+        let srv = test_srv(
+            vec![("X", "${TOK}"), ("Y", "${TOK}")],
+            vec![],
+            Sharing::Session,
+        );
+        let keys = relevant_env_keys(&srv);
+        assert_eq!(keys, vec!["TOK"]);
+    }
+
+    #[test]
+    fn relevant_env_keys_from_args_and_env() {
+        let srv = test_srv(vec![("X", "${A}")], vec!["--flag=${B}"], Sharing::Session);
+        let keys = relevant_env_keys(&srv);
+        assert_eq!(keys, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn backend_env_key_default_when_no_overrides() {
+        let srv = test_srv(vec![("X", "${TOK}")], vec![], Sharing::Credentials);
+        let key = backend_env_key(&srv, &HashMap::new());
+        assert_eq!(key, "__default__");
+    }
+
+    #[test]
+    fn backend_env_key_hashes_when_overrides_present() {
+        let srv = test_srv(vec![("X", "${TOK}")], vec![], Sharing::Credentials);
+        let mut env = HashMap::new();
+        env.insert("TOK".to_string(), "secret123".to_string());
+        let key = backend_env_key(&srv, &env);
+        assert!(key.starts_with("env:"), "expected env: prefix, got {key}");
+    }
+
+    #[test]
+    fn backend_env_key_same_creds_same_hash() {
+        let srv = test_srv(vec![("X", "${TOK}")], vec![], Sharing::Credentials);
+        let mut env1 = HashMap::new();
+        env1.insert("TOK".to_string(), "abc".to_string());
+        let mut env2 = HashMap::new();
+        env2.insert("TOK".to_string(), "abc".to_string());
+        assert_eq!(backend_env_key(&srv, &env1), backend_env_key(&srv, &env2));
+    }
+
+    #[test]
+    fn backend_env_key_different_creds_different_hash() {
+        let srv = test_srv(vec![("X", "${TOK}")], vec![], Sharing::Credentials);
+        let mut env1 = HashMap::new();
+        env1.insert("TOK".to_string(), "abc".to_string());
+        let mut env2 = HashMap::new();
+        env2.insert("TOK".to_string(), "xyz".to_string());
+        assert_ne!(backend_env_key(&srv, &env1), backend_env_key(&srv, &env2));
+    }
+
+    #[test]
+    fn backend_env_key_ignores_irrelevant_overrides() {
+        let srv = test_srv(vec![("X", "${TOK}")], vec![], Sharing::Credentials);
+        let mut env = HashMap::new();
+        env.insert("TOK".to_string(), "val".to_string());
+        env.insert("UNRELATED".to_string(), "noise".to_string());
+        let key_with = backend_env_key(&srv, &env);
+
+        let mut env2 = HashMap::new();
+        env2.insert("TOK".to_string(), "val".to_string());
+        let key_without = backend_env_key(&srv, &env2);
+
+        assert_eq!(key_with, key_without);
+    }
+
+    #[test]
+    fn djb2_hash_deterministic() {
+        assert_eq!(djb2_hash("hello"), djb2_hash("hello"));
+        assert_ne!(djb2_hash("hello"), djb2_hash("world"));
     }
 }

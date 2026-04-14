@@ -356,3 +356,79 @@ pub fn is_toggled_off(toggle: Option<&str>) -> bool {
             .is_some_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0"))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_env_no_vars() {
+        let out = expand_env_with_overrides("plain text", &HashMap::new());
+        assert_eq!(out, "plain text");
+    }
+
+    #[test]
+    fn expand_env_with_override() {
+        let mut ovr = HashMap::new();
+        ovr.insert("MY_VAR".to_string(), "hello".to_string());
+        let out = expand_env_with_overrides("prefix_${MY_VAR}_suffix", &ovr);
+        assert_eq!(out, "prefix_hello_suffix");
+    }
+
+    #[test]
+    fn expand_env_multiple_vars() {
+        let mut ovr = HashMap::new();
+        ovr.insert("A".to_string(), "1".to_string());
+        ovr.insert("B".to_string(), "2".to_string());
+        let out = expand_env_with_overrides("${A}+${B}", &ovr);
+        assert_eq!(out, "1+2");
+    }
+
+    #[test]
+    fn expand_env_missing_var_is_empty() {
+        // Ensure the var doesn't exist in process env
+        unsafe { std::env::remove_var("__TEST_MISSING_VAR__") };
+        let out = expand_env_with_overrides("${__TEST_MISSING_VAR__}", &HashMap::new());
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn is_toggled_off_none() {
+        assert!(!is_toggled_off(None));
+    }
+
+    #[test]
+    fn is_toggled_off_false() {
+        unsafe { std::env::set_var("__TEST_TOGGLE_F__", "false") };
+        assert!(is_toggled_off(Some("__TEST_TOGGLE_F__")));
+        unsafe { std::env::remove_var("__TEST_TOGGLE_F__") };
+    }
+
+    #[test]
+    fn is_toggled_off_zero() {
+        unsafe { std::env::set_var("__TEST_TOGGLE_Z__", "0") };
+        assert!(is_toggled_off(Some("__TEST_TOGGLE_Z__")));
+        unsafe { std::env::remove_var("__TEST_TOGGLE_Z__") };
+    }
+
+    #[test]
+    fn is_toggled_off_true_means_on() {
+        unsafe { std::env::set_var("__TEST_TOGGLE_T__", "true") };
+        assert!(!is_toggled_off(Some("__TEST_TOGGLE_T__")));
+        unsafe { std::env::remove_var("__TEST_TOGGLE_T__") };
+    }
+
+    #[test]
+    fn sharing_default_is_session() {
+        assert_eq!(Sharing::default(), Sharing::Session);
+    }
+
+    #[test]
+    fn sharing_serde_roundtrip() {
+        let json = r#""credentials""#;
+        let s: Sharing = serde_json::from_str(json).unwrap();
+        assert_eq!(s, Sharing::Credentials);
+        let back = serde_json::to_string(&s).unwrap();
+        assert_eq!(back, json);
+    }
+}

@@ -5,6 +5,7 @@
 //! the Docker container first.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use base64::Engine;
@@ -103,6 +104,31 @@ pub async fn run(
 
     eprintln!("bridge connecting to {url}");
 
+    // Shared session ID for signal handler access
+    let session_id_shared: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    // Spawn a ctrl+c handler that sends DELETE before exiting
+    {
+        let client = client.clone();
+        let url = url.to_string();
+        let sid = session_id_shared.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("\nbridge received ctrl+c");
+            let guard = sid.lock().await;
+            if let Some(ref id) = *guard {
+                eprintln!("bridge sending DELETE for session {id}");
+                let _ = client
+                    .delete(&url)
+                    .header("mcp-session-id", id)
+                    .send()
+                    .await;
+            }
+            std::process::exit(0);
+        });
+    }
+
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
         if line.is_empty() {
@@ -129,8 +155,11 @@ pub async fn run(
         match req.body(line).send().await {
             Ok(resp) => {
                 // Capture session id
-                if let Some(sid) = resp.headers().get("mcp-session-id") {
-                    session_id = sid.to_str().ok().map(String::from);
+                if let Some(sid_hdr) = resp.headers().get("mcp-session-id") {
+                    let new_sid = sid_hdr.to_str().ok().map(String::from);
+                    session_id = new_sid.clone();
+                    // Update shared copy for signal handler
+                    *session_id_shared.lock().await = new_sid;
                 }
 
                 let ct = resp
