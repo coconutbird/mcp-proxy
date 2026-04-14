@@ -300,10 +300,10 @@ impl Hub {
         self.ensure_backends(servers, env_overrides, session_id)
             .await;
 
-        let map = self.backends.read().await;
+        let mut map = self.backends.write().await;
         let mut out: Vec<Tool> = Vec::new();
 
-        for ((srv_name, env_key), entry) in map.iter() {
+        for ((srv_name, env_key), entry) in map.iter_mut() {
             let be = &entry.backend;
             if !servers.is_empty() && !servers.contains(srv_name) {
                 continue;
@@ -314,6 +314,9 @@ impl Hub {
             };
             if *env_key != expected {
                 continue;
+            }
+            if entry.last_used.is_some() {
+                entry.last_used = Some(Instant::now());
             }
             out.extend(be.tools.iter().cloned());
         }
@@ -335,9 +338,10 @@ impl Hub {
             return self.custom.call(name, &args).await;
         }
 
-        // Find backend by prefix, checking include list
-        let map = self.backends.read().await;
-        for ((srv_name, env_key), entry) in map.iter() {
+        // Find backend by prefix, checking include list.
+        // We use a write lock so we can touch `last_used` on hit.
+        let mut map = self.backends.write().await;
+        for ((srv_name, env_key), entry) in map.iter_mut() {
             let be = &entry.backend;
             if !servers.is_empty() && !servers.contains(srv_name) {
                 continue;
@@ -351,6 +355,9 @@ impl Hub {
             }
             let prefix = format!("{}_", be.name);
             if let Some(original) = name.strip_prefix(&prefix) {
+                if entry.last_used.is_some() {
+                    entry.last_used = Some(Instant::now());
+                }
                 return be.call_tool(original, args).await;
             }
         }
