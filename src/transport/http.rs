@@ -102,13 +102,19 @@ async fn handle_mcp(
     let env_overrides = decode_env_header(&headers);
     let servers = decode_servers_header(&headers);
 
-    // Resolve or create session (we only track the ID for DELETE cleanup)
+    // Resolve or create session — reject unknown session IDs to prevent
+    // hijacking of per-session backends.
     let session_id = match headers
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
     {
-        Some(id) => id,
+        Some(id) => {
+            if !state.sessions.read().await.contains(&id) {
+                return (StatusCode::NOT_FOUND, "unknown session").into_response();
+            }
+            id
+        }
         None => {
             let id = Uuid::new_v4().to_string();
             state.sessions.write().await.insert(id.clone());

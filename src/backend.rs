@@ -19,7 +19,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::config::{ServerConfig, expand_env_with_overrides};
+use crate::config::{ServerConfig, expand_env_with_overrides, resolve_env};
 
 /// Default RPC timeout if not configured per-server.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -52,12 +52,9 @@ pub struct Tool {
     pub description: Option<String>,
     #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
+    /// The original tool name before namespacing (used for filtering/aliases).
     #[serde(skip)]
-    #[allow(dead_code)]
     pub original_name: String,
-    #[serde(skip)]
-    #[allow(dead_code)]
-    pub backend_name: String,
 }
 
 /// Simple glob matcher supporting `*` wildcards.
@@ -167,14 +164,7 @@ impl Backend {
         let expand = |s: &str| expand_env_with_overrides(s, extra_env);
 
         let args: Vec<String> = cfg.args.iter().map(|a| expand(a)).collect();
-        let mut env: HashMap<String, String> = cfg
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), expand(v)))
-            .collect();
-        for (k, v) in extra_env {
-            env.entry(k.clone()).or_insert_with(|| v.clone());
-        }
+        let env = resolve_env(&cfg.env, extra_env);
 
         let use_docker =
             cfg.install.is_some() && matches!(cfg.runtime, crate::config::Runtime::Docker);
@@ -345,7 +335,7 @@ impl Backend {
         self.rpc(
             "initialize",
             serde_json::json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": crate::server::MCP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": { "name": "mcp-proxy", "version": env!("CARGO_PKG_VERSION") }
             }),
@@ -378,7 +368,6 @@ impl Backend {
                                 .map(Into::into),
                             input_schema: t.get("inputSchema").cloned(),
                             original_name: raw.into(),
-                            backend_name: self.name.clone(),
                         })
                     })
                     .collect();

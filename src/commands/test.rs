@@ -14,7 +14,7 @@ pub async fn run(config_path: &std::path::Path, filter_servers: &[String]) -> Re
     let mut fail = 0u32;
 
     for (name, srv) in &cfg.servers {
-        if name.starts_with('_') {
+        if srv.is_disabled(name) {
             continue;
         }
         if !filter_servers.is_empty() && !filter_servers.contains(name) {

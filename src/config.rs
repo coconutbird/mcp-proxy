@@ -6,9 +6,11 @@
 //! active profile selection.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -62,6 +64,17 @@ pub enum ExtractMethod {
     Tar,
     Zip,
     None,
+}
+
+impl fmt::Display for InstallConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Npm { package } => write!(f, "npm: {package}"),
+            Self::Pip { package } => write!(f, "pip: {package}"),
+            Self::Binary { binary, .. } => write!(f, "binary: {binary}"),
+            Self::Npx => write!(f, "npx"),
+        }
+    }
 }
 
 /// Where to run a backend that has an `install` config.
@@ -157,6 +170,14 @@ impl Default for ServerConfig {
             exclude_tools: Vec::new(),
             tool_aliases: HashMap::new(),
         }
+    }
+}
+
+impl ServerConfig {
+    /// A server is disabled if its name starts with `_` or its env toggle
+    /// evaluates to `false` / `0`.
+    pub fn is_disabled(&self, name: &str) -> bool {
+        name.starts_with('_') || is_toggled_off(self.env_toggle.as_deref())
     }
 }
 
@@ -304,30 +325,44 @@ pub struct Config {
 }
 
 impl Config {
-    /// Return server names that are active (not `_`-prefixed, not toggled off).
+    /// Return server names that are active (not disabled).
     pub fn active_server_names(&self) -> Vec<String> {
         self.servers
             .iter()
-            .filter(|(n, srv)| !n.starts_with('_') && !is_toggled_off(srv.env_toggle.as_deref()))
+            .filter(|(n, srv)| !srv.is_disabled(n))
             .map(|(n, _)| n.clone())
             .collect()
     }
 }
 
-/// Load and parse the servers config file.
-pub fn load(path: &Path) -> Result<Config> {
+// ---------------------------------------------------------------------------
+// Generic JSON file helpers
+// ---------------------------------------------------------------------------
+
+/// Load and parse a JSON file into `T`.
+pub fn load_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Save the servers config back to disk (pretty-printed JSON).
-pub fn save(path: &Path, cfg: &Config) -> Result<()> {
-    let json = serde_json::to_string_pretty(cfg)?;
+/// Save `T` as pretty-printed JSON with a trailing newline.
+pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(value)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, format!("{json}\n")).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Load and parse the servers config file.
+pub fn load(path: &Path) -> Result<Config> {
+    load_json(path)
+}
+
+/// Save the servers config back to disk (pretty-printed JSON).
+pub fn save(path: &Path, cfg: &Config) -> Result<()> {
+    save_json(path, cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -355,20 +390,12 @@ pub fn load_profiles(config_path: &Path) -> Result<ProfilesFile> {
     if !path.exists() {
         return Ok(ProfilesFile::default());
     }
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    load_json(&path)
 }
 
 /// Save profiles to profiles.json.
 pub fn save_profiles(config_path: &Path, profiles: &ProfilesFile) -> Result<()> {
-    let path = profiles_path(config_path);
-    let json = serde_json::to_string_pretty(profiles)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, format!("{json}\n"))
-        .with_context(|| format!("writing {}", path.display()))
+    save_json(&profiles_path(config_path), profiles)
 }
 
 /// List available profile names.
@@ -404,20 +431,11 @@ pub fn load_user_config() -> UserConfig {
     if !path.exists() {
         return UserConfig::default();
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    load_json(&path).unwrap_or_default()
 }
 
 pub fn save_user_config(cfg: &UserConfig) -> Result<()> {
-    let path = user_config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(&path, format!("{json}\n"))
-        .with_context(|| format!("writing {}", path.display()))
+    save_json(&user_config_path(), cfg)
 }
 
 pub fn read_active_profile() -> Option<String> {
@@ -435,31 +453,52 @@ pub fn write_active_profile(profile: Option<&str>) -> Result<()> {
 /// Falls back to the process environment when `lookup` returns `None`.
 pub fn expand_vars(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len()
-            && bytes[i] == b'$'
-            && bytes[i + 1] == b'{'
-            && let Some(rel_end) = s[i + 2..].find('}')
-        {
-            let key = &s[i + 2..i + 2 + rel_end];
-            let val = lookup(key)
-                .or_else(|| std::env::var(key).ok())
-                .unwrap_or_default();
-            out.push_str(&val);
-            i += 3 + rel_end; // skip past '}'
-            continue;
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let key = &after[..end];
+                let val = lookup(key)
+                    .or_else(|| std::env::var(key).ok())
+                    .unwrap_or_default();
+                out.push_str(&val);
+                rest = &after[end + 1..];
+            }
+            None => {
+                // Unclosed `${` — emit literally and stop
+                out.push_str(&rest[start..]);
+                rest = "";
+                break;
+            }
         }
-        out.push(bytes[i] as char);
-        i += 1;
     }
+    out.push_str(rest);
     out
 }
 
 /// Expand `${VAR}` references, checking `overrides` first, then process env.
 pub fn expand_env_with_overrides(s: &str, overrides: &HashMap<String, String>) -> String {
     expand_vars(s, |key| overrides.get(key).cloned())
+}
+
+/// Merge a server's configured `env` with per-client `overrides`.
+/// Config values are expanded first, then overrides fill in any keys
+/// not already present (config wins on collision since it was expanded
+/// using the overrides as a lookup).
+pub fn resolve_env(
+    config_env: &HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged: HashMap<String, String> = config_env
+        .iter()
+        .map(|(k, v)| (k.clone(), expand_env_with_overrides(v, overrides)))
+        .collect();
+    for (k, v) in overrides {
+        merged.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    merged
 }
 
 /// Check whether an env-toggle variable says "disabled".

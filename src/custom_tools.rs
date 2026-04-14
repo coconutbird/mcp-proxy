@@ -52,7 +52,6 @@ impl CustomTools {
                 description: Some(cfg.description().into()),
                 input_schema: Some(cfg.input_schema().clone()),
                 original_name: name.clone(),
-                backend_name: "custom".into(),
             })
             .collect()
     }

@@ -12,7 +12,9 @@ use tracing::{debug, info};
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
-use crate::config::{ExtractMethod, InstallConfig, ServerConfig, expand_env_with_overrides};
+use crate::config::{
+    ExtractMethod, InstallConfig, ServerConfig, expand_env_with_overrides, resolve_env,
+};
 use crate::util::fnv1a;
 
 /// Monotonic counter for unique container name suffixes.
@@ -206,14 +208,7 @@ pub async fn run_container(
     cmd.args(["run", "-i", "--rm", "--name", &container_name]);
 
     // Pass environment variables
-    let mut merged_env: HashMap<String, String> = cfg
-        .env
-        .iter()
-        .map(|(k, v)| (k.clone(), expand(v)))
-        .collect();
-    for (k, v) in extra_env {
-        merged_env.entry(k.clone()).or_insert_with(|| v.clone());
-    }
+    let merged_env = resolve_env(&cfg.env, extra_env);
     for (k, v) in &merged_env {
         cmd.args(["-e", &format!("{k}={v}")]);
     }
