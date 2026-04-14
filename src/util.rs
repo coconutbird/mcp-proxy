@@ -1,5 +1,18 @@
 //! Shared utility functions.
 
+use tokio::io::AsyncWriteExt;
+
+/// Write a single line of data (with trailing newline) and flush.
+///
+/// Used by stdio transport, bridge, and backend RPC to avoid
+/// repeating the write_all + newline + flush pattern.
+pub async fn write_line(w: &mut (impl AsyncWriteExt + Unpin), data: &[u8]) -> anyhow::Result<()> {
+    w.write_all(data).await?;
+    w.write_all(b"\n").await?;
+    w.flush().await?;
+    Ok(())
+}
+
 /// FNV-1a 64-bit hash — deterministic across Rust versions (unlike `DefaultHasher`).
 ///
 /// Used for config-change detection, credential scoping, and random seeding.

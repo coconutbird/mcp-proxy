@@ -45,6 +45,20 @@ const ENV_KEY_PREFIX: &str = "env:";
 pub const STDIO_SESSION_ID: &str = "__stdio__";
 
 // ---------------------------------------------------------------------------
+// JSON-RPC helpers
+// ---------------------------------------------------------------------------
+
+/// Build a JSON-RPC 2.0 success response.
+pub fn jsonrpc_ok(id: &Value, result: Value) -> Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+/// Build a JSON-RPC 2.0 error response.
+pub fn jsonrpc_err(id: &Value, code: i64, message: &str) -> Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+// ---------------------------------------------------------------------------
 // JSON-RPC error type
 // ---------------------------------------------------------------------------
 
@@ -75,11 +89,7 @@ impl RpcError {
     }
 
     pub fn to_json(&self, id: &Value) -> Value {
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": self.code(), "message": self.to_string() }
-        })
+        jsonrpc_err(id, self.code(), &self.to_string())
     }
 }
 
@@ -364,6 +374,17 @@ impl Hub {
         })
     }
 
+    /// Remove spawn-lock entries for the given backend keys.
+    async fn purge_spawn_locks(&self, keys: &[BackendKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut locks = self.spawn_locks.lock().await;
+        for key in keys {
+            locks.remove(key);
+        }
+    }
+
     /// Get or spawn a backend for the given server + client context.
     ///
     /// Key strategy by sharing mode:
@@ -485,18 +506,17 @@ impl Hub {
         Some(sharing_env_key(srv, env_overrides, session_id))
     }
 
-    /// Collect tools from matching backends, touching idle timers.
-    /// Acquires map write lock briefly to update timestamps, reads tool
-    /// lists from each backend's own mutex without holding the map lock.
-    async fn collect_tools(
+    /// Return matching backends for the given server filter, touching idle
+    /// timers along the way. Each entry is `(server_name, backend_arc)`.
+    async fn matched_backends(
         &self,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
         session_id: &str,
-    ) -> Vec<Tool> {
+    ) -> Vec<(String, Arc<tokio::sync::Mutex<Backend>>)> {
         let cfg = self.raw_config.read().await;
         let mut map = self.backends.write().await;
-        let mut matched: Vec<Arc<tokio::sync::Mutex<Backend>>> = Vec::new();
+        let mut matched = Vec::new();
 
         for ((srv_name, env_key), entry) in map.iter_mut() {
             if !servers.is_empty() && !servers.contains(srv_name) {
@@ -513,13 +533,23 @@ impl Hub {
             if entry.last_used.is_some() {
                 entry.last_used = Some(Instant::now());
             }
-            matched.push(entry.backend.clone());
+            matched.push((srv_name.clone(), entry.backend.clone()));
         }
-        drop(map);
-        drop(cfg);
+        matched
+    }
 
+    /// Collect tools from matching backends, touching idle timers.
+    async fn collect_tools(
+        &self,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) -> Vec<Tool> {
+        let matched = self
+            .matched_backends(servers, env_overrides, session_id)
+            .await;
         let mut out: Vec<Tool> = Vec::new();
-        for be_arc in &matched {
+        for (_name, be_arc) in &matched {
             let be = be_arc.lock().await;
             out.extend(be.tools.iter().cloned());
         }
@@ -635,36 +665,20 @@ impl Hub {
             }
         }
 
-        // Find the target backend using the server name from the key — no
-        // need to lock individual backends just to read `be.name`.
+        // Find the target backend by matching the tool name prefix against
+        // server names from the pre-filtered set.
+        let matched = self
+            .matched_backends(servers, env_overrides, session_id)
+            .await;
         let (be_arc, original_name) = {
-            let cfg = self.raw_config.read().await;
-            let mut map = self.backends.write().await;
             let mut found = None;
-
-            for ((srv_name, env_key), entry) in map.iter_mut() {
-                if !servers.is_empty() && !servers.contains(srv_name) {
-                    continue;
-                }
-                let expected =
-                    match Self::expected_key_with(&cfg, srv_name, env_overrides, session_id) {
-                        Some(k) => k,
-                        None => continue,
-                    };
-                if *env_key != expected {
-                    continue;
-                }
-                // Match tool prefix using the server name from the key
+            for (srv_name, be) in &matched {
                 let prefix = format!("{srv_name}_");
                 if let Some(original) = name.strip_prefix(&prefix) {
-                    if entry.last_used.is_some() {
-                        entry.last_used = Some(Instant::now());
-                    }
-                    found = Some((entry.backend.clone(), original.to_string()));
+                    found = Some((be.clone(), original.to_string()));
                     break;
                 }
             }
-
             match found {
                 Some(f) => f,
                 None => return Err(RpcError::ToolNotFound(name.to_string())),
@@ -784,13 +798,7 @@ impl Hub {
                 entry.backend.lock().await.kill();
             }
         }
-        // Purge spawn-lock entries for removed session backends.
-        if !stale.is_empty() {
-            let mut locks = self.spawn_locks.lock().await;
-            for key in &stale {
-                locks.remove(key);
-            }
-        }
+        self.purge_spawn_locks(&stale).await;
     }
 
     /// Kill all backend processes and wait for them to exit.
@@ -941,13 +949,7 @@ impl Hub {
 
         drop(map);
 
-        // Purge spawn-lock entries for removed/restarted backends.
-        if !removed_keys.is_empty() {
-            let mut locks = self.spawn_locks.lock().await;
-            for key in &removed_keys {
-                locks.remove(key);
-            }
-        }
+        self.purge_spawn_locks(&removed_keys).await;
 
         // 4. Update custom tools if changed
         if custom_changed {
@@ -963,28 +965,19 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Runtime, Sharing};
+    use crate::config::Sharing;
 
     /// Build a minimal ServerConfig for testing.
     fn test_srv(env: Vec<(&str, &str)>, args: Vec<&str>, sharing: Sharing) -> ServerConfig {
         ServerConfig {
-            install: None,
-            runtime: Runtime::default(),
             command: "echo".into(),
             args: args.into_iter().map(String::from).collect(),
             env: env
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            env_toggle: None,
             shared: sharing,
-            timeout_secs: None,
-            idle_timeout_secs: None,
-            auto_restart: true,
-            max_restarts: None,
-            include_tools: Vec::new(),
-            exclude_tools: Vec::new(),
-            tool_aliases: HashMap::new(),
+            ..Default::default()
         }
     }
 

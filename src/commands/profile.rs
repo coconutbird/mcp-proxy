@@ -99,10 +99,7 @@ pub fn run(config_path: &std::path::Path, action: ProfileCmd) -> Result<()> {
                 }
             }
             if let Some(rt) = runtime {
-                ovr.runtime = Some(match rt.as_str() {
-                    "local" => config::Runtime::Local,
-                    _ => config::Runtime::Docker,
-                });
+                ovr.runtime = Some(rt.parse().map_err(|e: String| anyhow::anyhow!(e))?);
             }
 
             config::save_profiles(config_path, &pf)?;

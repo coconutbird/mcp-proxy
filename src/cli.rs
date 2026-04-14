@@ -3,8 +3,18 @@
 //! All subcommand enums and their args are defined here, with no business
 //! logic. Actual command implementations live in [`crate::commands`].
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// MCP transport protocol.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum Transport {
+    /// Streamable-HTTP server with session management
+    #[default]
+    Http,
+    /// JSON-RPC over stdin/stdout (single client)
+    Stdio,
+}
 
 #[derive(Parser)]
 #[command(
@@ -31,7 +41,7 @@ pub enum Cmd {
     Serve {
         /// Transport: http or stdio
         #[arg(short, long, env = "MCP_TRANSPORT", default_value = "http")]
-        transport: String,
+        transport: Transport,
         /// Port for HTTP transport
         #[arg(short, long, env = "MCP_PORT", default_value_t = 3000)]
         port: u16,

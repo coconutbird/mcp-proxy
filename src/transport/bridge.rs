@@ -8,8 +8,11 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use base64::Engine;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, error, info, warn};
+
+use crate::server::jsonrpc_err;
+use crate::util::write_line;
 /// Collect env vars by name from the current process environment.
 fn collect_env_overrides(names: &[String]) -> HashMap<String, String> {
     names
@@ -158,15 +161,9 @@ pub async fn run(
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
                     error!(status = %status, body = body, "hub returned error");
-                    let err = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": { "code": -32000, "message": format!("hub returned HTTP {status}") }
-                    });
+                    let err = jsonrpc_err(&req_id, -32000, &format!("hub returned HTTP {status}"));
                     let out = serde_json::to_string(&err)?;
-                    stdout.write_all(out.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                    stdout.flush().await?;
+                    write_line(&mut stdout, out.as_bytes()).await?;
                     continue;
                 }
 
@@ -196,11 +193,16 @@ pub async fn run(
                     let mut buf = String::new();
                     while let Some(chunk) = resp.chunk().await? {
                         buf.push_str(&String::from_utf8_lossy(&chunk));
-                        // Process complete lines
+                        // Process complete lines — drain processed bytes to avoid
+                        // quadratic reallocations.
                         while let Some(pos) = buf.find('\n') {
-                            let line = buf[..pos].trim().to_string();
-                            buf = buf[pos + 1..].to_string();
-                            if let Some(data) = line.strip_prefix("data: ") {
+                            let line: String = buf.drain(..=pos).collect();
+                            let line = line.trim();
+                            // SSE spec: "data:" may or may not have a trailing space.
+                            let data = line
+                                .strip_prefix("data: ")
+                                .or_else(|| line.strip_prefix("data:"));
+                            if let Some(data) = data {
                                 let data = data.trim();
                                 if data.is_empty() {
                                     continue;
@@ -233,32 +235,22 @@ pub async fn run(
                                     continue;
                                 }
                                 // Regular JSON-RPC data → forward to client
-                                stdout.write_all(data.as_bytes()).await?;
-                                stdout.write_all(b"\n").await?;
-                                stdout.flush().await?;
+                                write_line(&mut stdout, data.as_bytes()).await?;
                             }
                         }
                     }
                 } else {
                     let body = resp.text().await.unwrap_or_default();
                     if !body.trim().is_empty() {
-                        stdout.write_all(body.trim().as_bytes()).await?;
-                        stdout.write_all(b"\n").await?;
+                        write_line(&mut stdout, body.trim().as_bytes()).await?;
                     }
-                    stdout.flush().await?;
                 }
             }
             Err(e) => {
                 error!(error = %e, "request failed");
-                let err = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": { "code": -32000, "message": format!("bridge error: {e}") }
-                });
+                let err = jsonrpc_err(&req_id, -32000, &format!("bridge error: {e}"));
                 let out = serde_json::to_string(&err)?;
-                stdout.write_all(out.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
+                write_line(&mut stdout, out.as_bytes()).await?;
             }
         }
     }

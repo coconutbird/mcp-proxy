@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify, oneshot};
 use tracing::{debug, info, warn};
@@ -414,9 +414,7 @@ impl Backend {
             let w = g.as_mut().ok_or_else(|| {
                 anyhow::anyhow!("[{}] stdin closed — backend may have crashed", self.name)
             })?;
-            w.write_all(msg.as_bytes()).await?;
-            w.write_all(b"\n").await?;
-            w.flush().await?;
+            crate::util::write_line(w, msg.as_bytes()).await?;
         }
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(v)) => v,
@@ -441,9 +439,7 @@ impl Backend {
         }))?;
         let mut g = self.stdin.lock().await;
         if let Some(w) = g.as_mut() {
-            w.write_all(msg.as_bytes()).await?;
-            w.write_all(b"\n").await?;
-            w.flush().await?;
+            crate::util::write_line(w, msg.as_bytes()).await?;
         }
         Ok(())
     }

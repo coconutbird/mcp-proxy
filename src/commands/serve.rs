@@ -7,10 +7,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::cli::Transport;
 use crate::server::Hub;
 
 /// Entry point for the `serve` subcommand.
-pub async fn run(config_path: &std::path::Path, transport: &str, port: u16) -> Result<()> {
+pub async fn run(config_path: &std::path::Path, transport: Transport, port: u16) -> Result<()> {
     // Auto-create config if it doesn't exist
     if let Some(p) = crate::config::init_config(config_path)? {
         eprintln!("created starter config: {}", p.display());
@@ -29,8 +30,8 @@ pub async fn run(config_path: &std::path::Path, transport: &str, port: u16) -> R
     let result = tokio::select! {
         r = async {
             match transport {
-                "stdio" => crate::transport::stdio::serve(hub.clone()).await,
-                _ => crate::transport::http::serve(hub.clone(), port).await,
+                Transport::Stdio => crate::transport::stdio::serve(hub.clone()).await,
+                Transport::Http => crate::transport::http::serve(hub.clone(), port).await,
             }
         } => r,
         _ = tokio::signal::ctrl_c() => {

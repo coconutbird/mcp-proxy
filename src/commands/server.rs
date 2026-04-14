@@ -1,7 +1,5 @@
 //! `mcp-proxy server` — manage servers in the config.
 
-use std::collections::HashMap;
-
 use anyhow::Result;
 
 use crate::cli::ServerCmd;
@@ -58,10 +56,12 @@ pub fn run(config_path: &std::path::Path, action: ServerCmd) -> Result<()> {
                 _ => None,
             };
 
-            let rt = match runtime.as_deref() {
-                Some("local") => config::Runtime::Local,
-                _ => config::Runtime::Docker,
-            };
+            let rt = runtime
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|e: String| anyhow::anyhow!(e))?
+                .unwrap_or_default();
 
             cfg.servers.insert(
                 name.clone(),
@@ -71,15 +71,7 @@ pub fn run(config_path: &std::path::Path, action: ServerCmd) -> Result<()> {
                     command,
                     args,
                     env: env.into_iter().collect(),
-                    env_toggle: None,
-                    shared: Default::default(),
-                    timeout_secs: None,
-                    idle_timeout_secs: None,
-                    auto_restart: true,
-                    max_restarts: None,
-                    include_tools: Vec::new(),
-                    exclude_tools: Vec::new(),
-                    tool_aliases: HashMap::new(),
+                    ..Default::default()
                 },
             );
 
@@ -123,10 +115,7 @@ pub fn run(config_path: &std::path::Path, action: ServerCmd) -> Result<()> {
                 srv.env.remove(&k);
             }
             if let Some(rt) = runtime {
-                srv.runtime = match rt.as_str() {
-                    "local" => config::Runtime::Local,
-                    _ => config::Runtime::Docker,
-                };
+                srv.runtime = rt.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             }
 
             config::save(config_path, &cfg)?;

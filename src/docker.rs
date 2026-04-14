@@ -5,6 +5,7 @@
 //! inside a container with stdio piped.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, info};
 
@@ -14,14 +15,14 @@ use tokio::process::Command;
 use crate::config::{ExtractMethod, InstallConfig, ServerConfig, expand_env_with_overrides};
 use crate::util::fnv1a;
 
-/// Simple random u32 using FNV-1a hash of current instant + thread id.
-fn rand_u32() -> u32 {
-    let seed = format!(
-        "{:?}{:?}",
-        std::time::Instant::now(),
-        std::thread::current().id()
-    );
-    fnv1a(&seed) as u32
+/// Monotonic counter for unique container name suffixes.
+static CONTAINER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Return a unique u32 suffix for container names, based on process ID and a
+/// monotonic counter. Collision-free within the same process.
+fn unique_suffix() -> u32 {
+    let seq = CONTAINER_SEQ.fetch_add(1, Ordering::Relaxed);
+    fnv1a(&format!("{}{seq}", std::process::id())) as u32
 }
 
 /// Docker image tag for a backend: `mcp-proxy/<name>`
@@ -198,7 +199,7 @@ pub async fn run_container(
 
     // Include a short random suffix to avoid naming collisions when
     // multiple credential-scoped instances of the same server run.
-    let suffix: u32 = rand_u32();
+    let suffix: u32 = unique_suffix();
     let container_name = format!("mcp-proxy-{name}-{suffix:08x}");
 
     let mut cmd = Command::new("docker");

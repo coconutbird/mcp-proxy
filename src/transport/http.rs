@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::server::{BackendProgress, Hub};
+use crate::server::{BackendProgress, Hub, jsonrpc_ok};
 
 /// Active session IDs. We only need to track existence for DELETE cleanup;
 /// per-request headers (`X-MCP-Servers`, `X-MCP-Env`) are decoded fresh
@@ -87,7 +87,9 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> anyhow::Result<()> {
     info!("  Health check: http://localhost:{port}/health");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -181,7 +183,7 @@ async fn handle_mcp(
                     .collect();
                 result["_errors"] = Value::Array(err_list);
             }
-            let body = serde_json::json!({ "jsonrpc": "2.0", "id": rid, "result": result });
+            let body = jsonrpc_ok(&rid, result);
             yield Ok(format!("data: {}\n\n", serde_json::to_string(&body).unwrap()));
         };
 
@@ -199,7 +201,7 @@ async fn handle_mcp(
         .await;
 
     let body = match result {
-        Ok(val) => serde_json::json!({ "jsonrpc": "2.0", "id": req_id, "result": val }),
+        Ok(val) => jsonrpc_ok(&req_id, val),
         Err(e) => e.to_json(&req_id),
     };
 
@@ -252,4 +254,24 @@ async fn handle_health(State(state): State<AppState>) -> Json<Value> {
         obj.insert("sessions".into(), state.sessions.read().await.len().into());
     }
     Json(health)
+}
+
+/// Wait for SIGINT or SIGTERM so axum can drain connections gracefully.
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = async { signal::ctrl_c().await.expect("ctrl+c handler") };
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("shutdown signal received, draining connections…");
 }

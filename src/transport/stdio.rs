@@ -9,10 +9,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{error, info};
 
-use crate::server::{Hub, STDIO_SESSION_ID};
+use crate::server::{Hub, STDIO_SESSION_ID, jsonrpc_ok};
+use crate::util::write_line;
 
 /// Run the aggregator over stdin/stdout (JSON-RPC, one message per line).
 pub async fn serve(hub: Arc<Hub>) -> Result<()> {
@@ -59,17 +60,11 @@ pub async fn serve(hub: Arc<Hub>) -> Result<()> {
         // Only send a response if the request had an id (not a notification)
         if let Some(id) = id {
             let resp = match response {
-                Ok(result) => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": result,
-                }),
+                Ok(result) => jsonrpc_ok(&id, result),
                 Err(e) => e.to_json(&id),
             };
             let out = serde_json::to_string(&resp)?;
-            stdout.write_all(out.as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+            write_line(&mut stdout, out.as_bytes()).await?;
         }
     }
 

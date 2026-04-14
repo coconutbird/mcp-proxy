@@ -75,6 +75,19 @@ pub enum Runtime {
     Local,
 }
 
+impl std::str::FromStr for Runtime {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "local" => Ok(Self::Local),
+            "docker" => Ok(Self::Docker),
+            _ => Err(format!(
+                "unknown runtime '{s}', expected 'docker' or 'local'"
+            )),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server configuration
 // ---------------------------------------------------------------------------
@@ -124,6 +137,27 @@ pub struct ServerConfig {
     /// Tool aliases: map from alias name → original tool name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tool_aliases: HashMap<String, String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            install: None,
+            runtime: Runtime::default(),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            env_toggle: None,
+            shared: Sharing::default(),
+            timeout_secs: None,
+            idle_timeout_secs: None,
+            auto_restart: true,
+            max_restarts: None,
+            include_tools: Vec::new(),
+            exclude_tools: Vec::new(),
+            tool_aliases: HashMap::new(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -400,16 +434,25 @@ pub fn write_active_profile(profile: Option<&str>) -> Result<()> {
 /// The lookup returns `Option<String>`; unresolved vars become empty strings.
 /// Falls back to the process environment when `lookup` returns `None`.
 pub fn expand_vars(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
-    let mut out = s.to_string();
-    while let Some(start) = out.find("${") {
-        let Some(end) = out[start..].find('}') else {
-            break;
-        };
-        let key = &out[start + 2..start + end];
-        let val = lookup(key)
-            .or_else(|| std::env::var(key).ok())
-            .unwrap_or_default();
-        out = format!("{}{}{}", &out[..start], val, &out[start + end + 1..]);
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len()
+            && bytes[i] == b'$'
+            && bytes[i + 1] == b'{'
+            && let Some(rel_end) = s[i + 2..].find('}')
+        {
+            let key = &s[i + 2..i + 2 + rel_end];
+            let val = lookup(key)
+                .or_else(|| std::env::var(key).ok())
+                .unwrap_or_default();
+            out.push_str(&val);
+            i += 3 + rel_end; // skip past '}'
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
     }
     out
 }
@@ -539,20 +582,8 @@ mod tests {
 
     fn test_srv_config(command: &str) -> ServerConfig {
         ServerConfig {
-            install: None,
-            runtime: Runtime::default(),
             command: command.into(),
-            args: Vec::new(),
-            env: HashMap::new(),
-            env_toggle: None,
-            shared: Sharing::default(),
-            timeout_secs: None,
-            idle_timeout_secs: None,
-            auto_restart: true,
-            max_restarts: None,
-            include_tools: Vec::new(),
-            exclude_tools: Vec::new(),
-            tool_aliases: HashMap::new(),
+            ..Default::default()
         }
     }
 

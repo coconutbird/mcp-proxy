@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
 
     match args.command {
         cli::Cmd::Serve { transport, port } => {
-            commands::cmd_serve(&args.config, &transport, port).await
+            commands::cmd_serve(&args.config, transport, port).await
         }
         cli::Cmd::Bridge {
             url,
