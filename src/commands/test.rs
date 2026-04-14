@@ -17,7 +17,8 @@ pub async fn run(config_path: &std::path::Path, filter_servers: &[String]) -> Re
         .servers
         .iter()
         .filter(|(name, srv)| {
-            !srv.is_disabled(name) && (filter_servers.is_empty() || filter_servers.contains(name))
+            !crate::config::is_server_disabled(name, srv)
+                && (filter_servers.is_empty() || filter_servers.contains(name))
         })
         .map(|(name, srv)| (name.clone(), srv.clone()))
         .collect();

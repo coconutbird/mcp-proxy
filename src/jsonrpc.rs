@@ -98,3 +98,48 @@ pub mod codes {
     /// Generic internal/backend error.
     pub const INTERNAL: i64 = -32000;
 }
+
+// ---------------------------------------------------------------------------
+// Domain-level RPC error (used by Hub dispatch + pool)
+// ---------------------------------------------------------------------------
+
+/// Structured error type for JSON-RPC responses.
+///
+/// Maps to standard JSON-RPC 2.0 error codes so HTTP and stdio transports
+/// can return proper error objects instead of generic -32000.
+#[derive(Debug, thiserror::Error)]
+pub enum RpcError {
+    /// -32601: Method not found.
+    #[error("unsupported method: {0}")]
+    MethodNotFound(String),
+    /// -32602: Invalid params (e.g. missing tool name).
+    #[error("{0}")]
+    InvalidParams(String),
+    /// -32002: Tool not found (server-defined error).
+    #[error("unknown tool: {0}")]
+    ToolNotFound(String),
+    /// -32000: Generic backend / internal error.
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl RpcError {
+    pub fn code(&self) -> i64 {
+        match self {
+            Self::MethodNotFound(_) => codes::METHOD_NOT_FOUND,
+            Self::InvalidParams(_) => codes::INVALID_PARAMS,
+            Self::ToolNotFound(_) => codes::TOOL_NOT_FOUND,
+            Self::Internal(_) => codes::INTERNAL,
+        }
+    }
+
+    pub fn to_json(&self, id: &Value) -> Value {
+        err(id, self.code(), &self.to_string())
+    }
+}
+
+impl From<anyhow::Error> for RpcError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e.to_string())
+    }
+}

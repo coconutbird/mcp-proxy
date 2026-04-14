@@ -201,21 +201,21 @@ impl Backend {
         tokio::spawn(async move {
             let mut lines = BufReader::new(child_stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(resp) = serde_json::from_str::<jsonrpc::Response>(&line) else {
+                let Ok(mut resp) = serde_json::from_str::<jsonrpc::Response>(&line) else {
                     warn!("[{tag}] non-json stdout: {line}");
                     continue;
                 };
                 let Some(id) = resp.id else { continue };
                 if let Some(tx) = p.lock().await.remove(&id) {
-                    let val = match resp.error {
+                    let val = match resp.error.take() {
                         Some(e) => Err(anyhow::anyhow!("{}", e.message)),
-                        None => Ok(resp.result.unwrap_or(Value::Null)),
+                        None => Ok(resp.result.take().unwrap_or(Value::Null)),
                     };
                     let _ = tx.send(val);
                 }
             }
             // stdout closed → process exited — fail all in-flight RPCs immediately
-            crash_flag.store(true, Ordering::Relaxed);
+            crash_flag.store(true, Ordering::Release);
             let mut pending = p.lock().await;
             for (_id, tx) in pending.drain() {
                 let _ = tx.send(Err(anyhow::anyhow!("[{tag}] backend process exited")));
@@ -264,7 +264,12 @@ impl Backend {
 
     /// Returns true if the backend process has crashed.
     pub fn has_crashed(&self) -> bool {
-        self.crashed.load(Ordering::Relaxed)
+        self.crashed.load(Ordering::Acquire)
+    }
+
+    /// Clone of the shared crash flag for lock-free observation.
+    pub fn crashed_flag(&self) -> Arc<AtomicBool> {
+        self.crashed.clone()
     }
 
     /// Attempt to restart the backend after a crash.
@@ -290,7 +295,7 @@ impl Backend {
         self.kill();
 
         // Reset crash state
-        self.crashed.store(false, Ordering::Relaxed);
+        self.crashed.store(false, Ordering::Release);
         self.ready = false;
         self.restart_count += 1;
 
@@ -367,7 +372,7 @@ impl Backend {
 
     async fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
         // Check if process has crashed before trying
-        if self.crashed.load(Ordering::Relaxed) {
+        if self.crashed.load(Ordering::Acquire) {
             bail!(
                 "[{}] backend process has crashed — restart pending",
                 self.name

@@ -15,6 +15,7 @@ use tracing::info;
 use crate::backend::Tool;
 use crate::config::Config;
 use crate::custom_tools::CustomTools;
+use crate::jsonrpc::RpcError;
 use crate::pool::BackendPool;
 
 // Re-export items that external code references via `crate::server::*`.
@@ -29,52 +30,6 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Session ID used for stdio transport (single implicit session).
 pub const STDIO_SESSION_ID: &str = "__stdio__";
-
-// ---------------------------------------------------------------------------
-// JSON-RPC error type
-// ---------------------------------------------------------------------------
-
-/// Structured error type for JSON-RPC responses.
-///
-/// Maps to standard JSON-RPC 2.0 error codes so HTTP and stdio transports
-/// can return proper error objects instead of generic -32000.
-#[derive(Debug, thiserror::Error)]
-pub enum RpcError {
-    /// -32601: Method not found.
-    #[error("unsupported method: {0}")]
-    MethodNotFound(String),
-    /// -32602: Invalid params (e.g. missing tool name).
-    #[error("{0}")]
-    InvalidParams(String),
-    /// -32002: Tool not found (server-defined error).
-    #[error("unknown tool: {0}")]
-    ToolNotFound(String),
-    /// -32000: Generic backend / internal error.
-    #[error("{0}")]
-    Internal(String),
-}
-
-impl RpcError {
-    pub fn code(&self) -> i64 {
-        use crate::jsonrpc::codes;
-        match self {
-            Self::MethodNotFound(_) => codes::METHOD_NOT_FOUND,
-            Self::InvalidParams(_) => codes::INVALID_PARAMS,
-            Self::ToolNotFound(_) => codes::TOOL_NOT_FOUND,
-            Self::Internal(_) => codes::INTERNAL,
-        }
-    }
-
-    pub fn to_json(&self, id: &Value) -> Value {
-        crate::jsonrpc::err(id, self.code(), &self.to_string())
-    }
-}
-
-impl From<anyhow::Error> for RpcError {
-    fn from(e: anyhow::Error) -> Self {
-        Self::Internal(e.to_string())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Hub — thin routing layer combining BackendPool + CustomTools
@@ -92,7 +47,7 @@ impl Hub {
     /// Boot the hub: creates the backend pool and loads custom tools.
     pub async fn new(raw_config: Config) -> Result<Self> {
         let pool = Arc::new(BackendPool::new(&raw_config).await?);
-        let custom = Arc::new(CustomTools::new(&raw_config.custom_tools));
+        let custom = Arc::new(CustomTools::new(raw_config.custom_tools.clone()));
         Ok(Self {
             pool,
             custom: RwLock::new(custom),
@@ -225,7 +180,8 @@ impl Hub {
     pub async fn reload(&self, new_config: Config) {
         let custom_changed = self.pool.reload_backends(&new_config).await;
         if custom_changed {
-            *self.custom.write().await = Arc::new(CustomTools::new(&new_config.custom_tools));
+            *self.custom.write().await =
+                Arc::new(CustomTools::new(new_config.custom_tools.clone()));
             info!("custom tools reloaded");
         }
         info!("config reload complete");

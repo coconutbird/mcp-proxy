@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -15,8 +15,10 @@ use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{Backend, Tool};
-use crate::config::{Config, ServerConfig, Sharing, diff_fields, extract_var_names};
-use crate::server::RpcError;
+use crate::config::{
+    Config, ServerConfig, Sharing, diff_fields, extract_var_names, is_server_disabled,
+};
+use crate::jsonrpc::RpcError;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -72,15 +74,54 @@ const NOT_REAPABLE: u64 = 0;
 /// `last_used_ms` is an atomic counter so that [`BackendPool::matched_backends`]
 /// can bump it under a *read* lock instead of requiring a write lock on every
 /// request. `NOT_REAPABLE` (0) means the entry is never reaped.
+///
+/// `sharing` and `env_key_vars` are cached from the server config at spawn time
+/// so that hot-path matching can avoid locking `raw_config`.
 struct BackendEntry {
     backend: Arc<TokioMutex<Backend>>,
     last_used_ms: AtomicU64,
+    /// Cached sharing mode from the server config.
+    sharing: Sharing,
+    /// Cached list of relevant env variable names (for Credentials matching).
+    env_key_vars: Vec<String>,
+    // --- Atomic health snapshot (lock-free reads for /health) ---
+    /// Number of discovered tools.
+    tool_count: Arc<AtomicU64>,
+    /// Whether the backend has completed the MCP handshake.
+    ready: Arc<AtomicBool>,
+    /// Number of crash-restarts.
+    restart_count: Arc<AtomicU64>,
+    /// Shared crash flag (same Arc as Backend.crashed).
+    crashed: Arc<AtomicBool>,
+}
+
+/// Lightweight handle for syncing backend health atomics after a tool call.
+/// Cloning `Arc<AtomicX>` is cheap and avoids holding a reference to the entry.
+struct HealthSync {
+    ready: Arc<AtomicBool>,
+    tool_count: Arc<AtomicU64>,
+    restart_count: Arc<AtomicU64>,
+}
+
+impl HealthSync {
+    fn sync(&self, be: &Backend) {
+        self.ready.store(be.ready, Ordering::Release);
+        self.tool_count
+            .store(be.tools.len() as u64, Ordering::Release);
+        self.restart_count
+            .store(be.restart_count as u64, Ordering::Release);
+    }
 }
 
 impl BackendEntry {
     /// Wrap a backend in an entry. `reapable = true` starts the idle timer;
     /// `false` means the instance is never reaped (e.g. Global sharing).
-    fn new(backend: Backend, reapable: bool) -> Self {
+    fn new(backend: Backend, srv: &ServerConfig) -> Self {
+        let reapable = !matches!(srv.shared, Sharing::Global);
+        let tool_count = backend.tools.len() as u64;
+        let ready = backend.ready;
+        let restart_count = backend.restart_count as u64;
+        let crashed = backend.crashed_flag();
         Self {
             backend: Arc::new(TokioMutex::new(backend)),
             last_used_ms: AtomicU64::new(if reapable {
@@ -88,6 +129,21 @@ impl BackendEntry {
             } else {
                 NOT_REAPABLE
             }),
+            sharing: srv.shared.clone(),
+            env_key_vars: relevant_env_keys(srv),
+            tool_count: Arc::new(AtomicU64::new(tool_count)),
+            ready: Arc::new(AtomicBool::new(ready)),
+            restart_count: Arc::new(AtomicU64::new(restart_count)),
+            crashed,
+        }
+    }
+
+    /// Build a [`HealthSync`] handle from this entry (cheap Arc clones).
+    fn health_sync(&self) -> HealthSync {
+        HealthSync {
+            ready: self.ready.clone(),
+            tool_count: self.tool_count.clone(),
+            restart_count: self.restart_count.clone(),
         }
     }
 
@@ -111,6 +167,31 @@ impl BackendEntry {
             return None;
         }
         Some(millis_to_instant(ms).elapsed().as_secs())
+    }
+
+    /// Compute the expected scope key for this entry using cached sharing
+    /// info — no config lock required.
+    fn expected_scope(&self, env_overrides: &HashMap<String, String>, session_id: &str) -> String {
+        match self.sharing {
+            Sharing::Global => DEFAULT_ENV_KEY.to_string(),
+            Sharing::Session => format!("{SESSION_KEY_PREFIX}{session_id}"),
+            Sharing::Credentials => {
+                let relevant: Vec<&String> = self
+                    .env_key_vars
+                    .iter()
+                    .filter(|k| env_overrides.contains_key(k.as_str()))
+                    .collect();
+                if relevant.is_empty() {
+                    return DEFAULT_ENV_KEY.to_string();
+                }
+                let s = relevant
+                    .iter()
+                    .map(|k| format!("{}={}", k, env_overrides.get(k.as_str()).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("\0");
+                format!("{ENV_KEY_PREFIX}{:x}", fnv1a(&s))
+            }
+        }
     }
 }
 
@@ -205,7 +286,7 @@ impl BackendPool {
 
         info!("starting backends");
         for (name, srv) in &raw_config.servers {
-            if srv.is_disabled(name) {
+            if is_server_disabled(name, srv) {
                 debug!(server = %name, "skipping (disabled)");
                 continue;
             }
@@ -252,7 +333,7 @@ impl BackendPool {
                 match Backend::start(name.clone(), &srv, &env).await {
                     Ok(be) => {
                         info!(server = %name, tools = be.tools.len(), "backend ready");
-                        Ok((name, env_key, be))
+                        Ok((name, env_key, be, srv))
                     }
                     Err(e) => {
                         error!(server = %name, "start failed: {e}");
@@ -264,13 +345,13 @@ impl BackendPool {
 
         let mut backends = HashMap::new();
         for handle in handles {
-            if let Ok(Ok((name, env_key, be))) = handle.await {
+            if let Ok(Ok((name, env_key, be, srv))) = handle.await {
                 backends.insert(
                     BackendKey {
                         server: name,
                         scope: env_key,
                     },
-                    BackendEntry::new(be, false),
+                    BackendEntry::new(be, &srv),
                 );
             }
         }
@@ -444,9 +525,8 @@ impl BackendPool {
         info!("spawning backend {name} ({env_key})");
         let backend = Backend::start(name.to_string(), &srv, env_overrides).await?;
 
-        let reapable = !matches!(srv.shared, Sharing::Global);
         let mut map = self.backends.write().await;
-        map.insert(key.clone(), BackendEntry::new(backend, reapable));
+        map.insert(key.clone(), BackendEntry::new(backend, &srv));
         Ok(key)
     }
 
@@ -491,24 +571,16 @@ impl BackendPool {
         errors
     }
 
-    fn expected_key_with(
-        cfg: &Config,
-        srv_name: &str,
-        env_overrides: &HashMap<String, String>,
-        session_id: &str,
-    ) -> Option<String> {
-        let srv = cfg.servers.get(srv_name)?;
-        Some(sharing_env_key(srv, env_overrides, session_id))
-    }
-
     /// Return matching backends for the given server filter.
+    ///
+    /// Uses cached sharing mode on each entry so we only need the backends
+    /// read-lock — no config lock on the hot path.
     pub(crate) async fn matched_backends(
         &self,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
         session_id: &str,
     ) -> Vec<(String, Arc<TokioMutex<Backend>>)> {
-        let cfg = self.raw_config.read().await;
         let map = self.backends.read().await;
         let mut matched = Vec::new();
 
@@ -516,11 +588,7 @@ impl BackendPool {
             if !servers.is_empty() && !servers.contains(&key.server) {
                 continue;
             }
-            let expected =
-                match Self::expected_key_with(&cfg, &key.server, env_overrides, session_id) {
-                    Some(k) => k,
-                    None => continue,
-                };
+            let expected = entry.expected_scope(env_overrides, session_id);
             if key.scope != expected {
                 continue;
             }
@@ -578,7 +646,7 @@ impl BackendPool {
                         let tool_count = {
                             let map = pool.backends.read().await;
                             match map.get(&key) {
-                                Some(e) => e.backend.lock().await.tools.len(),
+                                Some(e) => e.tool_count.load(Ordering::Acquire) as usize,
                                 None => 0,
                             }
                         };
@@ -618,6 +686,9 @@ impl BackendPool {
     }
 
     /// Route a tool call to the correct backend.
+    ///
+    /// Uses backend-entry cached sharing info so we only need the backends
+    /// read-lock — no config lock on the hot path.
     pub(crate) async fn call_tool(
         &self,
         name: &str,
@@ -626,34 +697,29 @@ impl BackendPool {
         env_overrides: &HashMap<String, String>,
         session_id: &str,
     ) -> Result<Value, RpcError> {
-        // Direct lookup: extract the server name from the tool prefix and go
-        // straight to the backend map entry instead of scanning every backend.
-        let cfg = self.raw_config.read().await;
         let map = self.backends.read().await;
 
-        let (be_arc, original_name) = {
+        // We need both the backend Arc AND health-sync atomics.
+        let (be_arc, original_name, health_sync) = {
             let mut found = None;
-            for (srv_name, srv_cfg) in &cfg.servers {
-                if !servers.is_empty() && !servers.contains(srv_name) {
+            for (key, entry) in map.iter() {
+                if !servers.is_empty() && !servers.contains(&key.server) {
                     continue;
                 }
-                let prefix = format!("{srv_name}_");
+                let prefix = format!("{}_", key.server);
                 if let Some(original) = name.strip_prefix(&prefix) {
-                    let scope = sharing_env_key(srv_cfg, env_overrides, session_id);
-                    let key = BackendKey {
-                        server: srv_name.clone(),
-                        scope,
-                    };
-                    if let Some(entry) = map.get(&key) {
+                    let expected = entry.expected_scope(env_overrides, session_id);
+                    if key.scope == expected {
                         entry.touch();
-                        found = Some((entry.backend.clone(), original.to_string()));
+                        // Capture atomics for post-call sync (cheap Arc clones).
+                        let sync = entry.health_sync();
+                        found = Some((entry.backend.clone(), original.to_string(), sync));
                     }
                     break;
                 }
             }
-            // Drop locks before awaiting the backend mutex.
+            // Drop lock before awaiting the backend mutex.
             drop(map);
-            drop(cfg);
             match found {
                 Some(f) => f,
                 None => return Err(RpcError::ToolNotFound(name.to_string())),
@@ -661,9 +727,10 @@ impl BackendPool {
         };
 
         let mut be = be_arc.lock().await;
-        be.call_tool(&original_name, args)
-            .await
-            .map_err(RpcError::from)
+        let result = be.call_tool(&original_name, args).await;
+        // Sync atomics in case call_tool triggered an auto-restart.
+        health_sync.sync(&be);
+        result.map_err(RpcError::from)
     }
 
     /// Health summary of backend processes.
@@ -683,14 +750,14 @@ impl BackendPool {
             } else {
                 "session"
             };
-            let be = entry.backend.lock().await;
+            // Read from atomics — no backend mutex needed.
             entries.push(serde_json::json!({
                 "name": key.server,
                 "scope": scope,
-                "ready": be.ready,
-                "crashed": be.has_crashed(),
-                "tools": be.tools.len(),
-                "restarts": be.restart_count,
+                "ready": entry.ready.load(Ordering::Acquire),
+                "crashed": entry.crashed.load(Ordering::Acquire),
+                "tools": entry.tool_count.load(Ordering::Acquire),
+                "restarts": entry.restart_count.load(Ordering::Acquire),
                 "idle_secs": entry.idle_secs(),
             }));
         }
@@ -748,7 +815,7 @@ impl BackendPool {
             let mut add = Vec::new();
 
             for (name, old_srv) in old_servers {
-                if old_srv.is_disabled(name) {
+                if is_server_disabled(name, old_srv) {
                     continue;
                 }
                 match new_servers.get(name) {
@@ -767,7 +834,7 @@ impl BackendPool {
             }
 
             for (name, srv) in new_servers {
-                if !srv.is_disabled(name) && !old_servers.contains_key(name) {
+                if !is_server_disabled(name, srv) && !old_servers.contains_key(name) {
                     add.push(name.clone());
                 }
             }
@@ -791,35 +858,47 @@ impl BackendPool {
         );
 
         let new_servers = &new_config.servers;
-        let mut map = self.backends.write().await;
 
-        // 1. Remove deleted servers (kill all scopes)
+        // Phase 1: Hold write lock only to remove/kill old entries (fast).
         let mut removed_keys = Vec::new();
-        for name in &to_remove {
-            let keys: Vec<BackendKey> = map.keys().filter(|k| k.server == *name).cloned().collect();
-            for key in keys {
-                if let Some(entry) = map.remove(&key) {
+        {
+            let mut map = self.backends.write().await;
+
+            // Remove deleted servers (kill all scopes)
+            for name in &to_remove {
+                let keys: Vec<BackendKey> =
+                    map.keys().filter(|k| k.server == *name).cloned().collect();
+                for key in keys {
+                    if let Some(entry) = map.remove(&key) {
+                        entry.backend.lock().await.kill();
+                        removed_keys.push(key);
+                    }
+                }
+                info!(server = %name, "removed");
+            }
+
+            // Kill the default-scope entry for changed servers
+            for name in &to_restart {
+                let default_key = BackendKey {
+                    server: name.clone(),
+                    scope: DEFAULT_ENV_KEY.to_string(),
+                };
+                if let Some(entry) = map.remove(&default_key) {
                     entry.backend.lock().await.kill();
-                    removed_keys.push(key);
+                    removed_keys.push(default_key);
                 }
             }
-            info!(server = %name, "removed");
-        }
+        } // write lock dropped — reads are unblocked during spawns
 
-        // 2. Restart changed servers
+        // Phase 2: Start backends concurrently without holding the lock.
+        // Collect (name, config) pairs that need a fresh Backend::start.
+        let mut to_start: Vec<(String, &ServerConfig)> = Vec::new();
+
         for name in &to_restart {
-            let default_key = BackendKey {
-                server: name.clone(),
-                scope: DEFAULT_ENV_KEY.to_string(),
-            };
-            if let Some(entry) = map.remove(&default_key) {
-                entry.backend.lock().await.kill();
-                removed_keys.push(default_key);
-            }
             let Some(srv) = new_servers.get(name) else {
                 continue;
             };
-            if srv.is_disabled(name) {
+            if is_server_disabled(name, srv) {
                 info!(server = %name, "disabled after reload");
                 continue;
             }
@@ -827,27 +906,14 @@ impl BackendPool {
                 continue;
             }
             info!(server = %name, "restarting");
-            match Backend::start(name.clone(), srv, &empty_env).await {
-                Ok(be) => {
-                    let env_key = backend_env_key(srv, &empty_env);
-                    map.insert(
-                        BackendKey {
-                            server: name.clone(),
-                            scope: env_key,
-                        },
-                        BackendEntry::new(be, false),
-                    );
-                }
-                Err(e) => error!(server = %name, "restart failed: {e}"),
-            }
+            to_start.push((name.clone(), srv));
         }
 
-        // 3. Start newly added servers
         for name in &to_add {
             let Some(srv) = new_servers.get(name) else {
                 continue;
             };
-            if srv.is_disabled(name) {
+            if is_server_disabled(name, srv) {
                 continue;
             }
             if !matches!(srv.shared, Sharing::Global) {
@@ -855,22 +921,38 @@ impl BackendPool {
                 continue;
             }
             info!(server = %name, "starting (new in config)");
+            to_start.push((name.clone(), srv));
+        }
+
+        // Start backends sequentially but WITHOUT the write lock held.
+        // This is the critical improvement: reads (tools/list, tools/call) are
+        // not blocked while backends spawn and handshake.
+        let mut started: Vec<(String, BackendEntry)> = Vec::new();
+        for (name, srv) in &to_start {
             match Backend::start(name.clone(), srv, &empty_env).await {
                 Ok(be) => {
-                    let env_key = backend_env_key(srv, &empty_env);
-                    map.insert(
-                        BackendKey {
-                            server: name.clone(),
-                            scope: env_key,
-                        },
-                        BackendEntry::new(be, false),
-                    );
+                    started.push((name.clone(), BackendEntry::new(be, srv)));
                 }
                 Err(e) => error!(server = %name, "start failed: {e}"),
             }
         }
 
-        drop(map);
+        // Phase 3: Re-acquire write lock to insert results (fast).
+        {
+            let mut map = self.backends.write().await;
+            for (name, entry) in started {
+                let srv = new_servers.get(&name).expect("server vanished from config");
+                let env_key = backend_env_key(srv, &empty_env);
+                map.insert(
+                    BackendKey {
+                        server: name,
+                        scope: env_key,
+                    },
+                    entry,
+                );
+            }
+        }
+
         self.purge_spawn_locks(&removed_keys).await;
 
         *self.raw_config.write().await = new_config.clone();

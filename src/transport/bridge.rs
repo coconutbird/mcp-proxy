@@ -65,6 +65,7 @@ pub fn parse_sse_line(line: &str) -> SseEvent {
         None => SseEvent::Skip,
     }
 }
+
 /// Collect env vars by name from the current process environment.
 fn collect_env_overrides(names: &[String]) -> HashMap<String, String> {
     names
@@ -237,11 +238,14 @@ pub async fn run(
                     .contains("text/event-stream");
 
                 if is_sse {
-                    let mut buf = String::new();
+                    // Use a byte buffer so multi-byte UTF-8 codepoints split
+                    // across HTTP chunks are not corrupted by from_utf8_lossy.
+                    let mut buf = Vec::<u8>::new();
                     while let Some(chunk) = resp.chunk().await? {
-                        buf.push_str(&String::from_utf8_lossy(&chunk));
-                        while let Some(pos) = buf.find('\n') {
-                            let line: String = buf.drain(..=pos).collect();
+                        buf.extend_from_slice(&chunk);
+                        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                            let line = String::from_utf8_lossy(&line_bytes);
                             match parse_sse_line(&line) {
                                 SseEvent::Progress { server, status } => match status.as_str() {
                                     "ready" => info!(server = %server, "backend ready"),

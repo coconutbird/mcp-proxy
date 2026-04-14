@@ -5,6 +5,7 @@
 //! inside a container with stdio piped.
 
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, info};
@@ -36,7 +37,8 @@ fn image_tag(name: &str) -> String {
 fn generate_dockerfile(cfg: &ServerConfig) -> Option<String> {
     let install = cfg.install.as_ref()?;
 
-    let mut d = String::from("FROM node:lts-slim\n\n");
+    let mut d = String::with_capacity(512);
+    writeln!(d, "FROM node:lts-slim\n").unwrap();
 
     // Base deps
     let needs_python = matches!(install, InstallConfig::Pip { .. });
@@ -61,44 +63,56 @@ fn generate_dockerfile(cfg: &ServerConfig) -> Option<String> {
         apt.push("unzip");
     }
 
-    d.push_str(&format!(
-        "RUN apt-get update && apt-get install -y --no-install-recommends \\\n    {} \\\n && rm -rf /var/lib/apt/lists/*\n",
+    writeln!(
+        d,
+        "RUN apt-get update && apt-get install -y --no-install-recommends \\\n    {} \\\n && rm -rf /var/lib/apt/lists/*",
         apt.join(" \\\n    ")
-    ));
+    )
+    .unwrap();
 
     // Install the backend
     match install {
         InstallConfig::Npm { package } => {
-            d.push_str(&format!("\nRUN npm install -g {package}\n"));
+            writeln!(d, "\nRUN npm install -g {package}").unwrap();
         }
         InstallConfig::Pip { package } => {
-            d.push_str(&format!(
-                "\nRUN pip3 install --break-system-packages {package}\n"
-            ));
+            writeln!(d, "\nRUN pip3 install --break-system-packages {package}").unwrap();
         }
         InstallConfig::Binary {
             url,
             extract,
             binary,
         } => {
-            let has_arch = url.contains("${ARCH}");
-            if has_arch {
-                d.push_str(&format!(
-                    "\nARG TARGETARCH\nRUN ARCH=$(case \"${{TARGETARCH}}\" in \\\n      \"amd64\") echo \"x86_64\" ;; \\\n      \"arm64\") echo \"arm64\" ;; \\\n      *) echo \"x86_64\" ;; \\\n    esac) && \\\n    curl -fsSL \"{url}\" -o /tmp/dl"
-                ));
+            if url.contains("${ARCH}") {
+                write!(
+                    d,
+                    "\nARG TARGETARCH\n\
+                     RUN ARCH=$(case \"${{TARGETARCH}}\" in \\\n\
+                     {s}\"amd64\") echo \"x86_64\" ;; \\\n\
+                     {s}\"arm64\") echo \"arm64\" ;; \\\n\
+                     {s}*) echo \"x86_64\" ;; \\\n\
+                     {s2}esac) && \\\n\
+                     {s2}curl -fsSL \"{url}\" -o /tmp/dl",
+                    s = "      ",
+                    s2 = "    ",
+                )
+                .unwrap();
             } else {
-                d.push_str(&format!("\nRUN curl -fsSL \"{url}\" -o /tmp/dl"));
+                write!(d, "\nRUN curl -fsSL \"{url}\" -o /tmp/dl").unwrap();
             }
             match extract.as_ref().unwrap_or(&ExtractMethod::None) {
-                ExtractMethod::Tar => d.push_str(&format!(
-                    " && \\\n    tar -xzf /tmp/dl -C /usr/local/bin {binary} && \\\n    rm /tmp/dl && chmod +x /usr/local/bin/{binary}\n"
-                )),
-                ExtractMethod::Zip => d.push_str(&format!(
-                    " && \\\n    unzip /tmp/dl -d /tmp/ex && \\\n    mv /tmp/ex/{binary} /usr/local/bin/ && \\\n    rm -rf /tmp/dl /tmp/ex && chmod +x /usr/local/bin/{binary}\n"
-                )),
-                ExtractMethod::None => d.push_str(&format!(
-                    " && \\\n    mv /tmp/dl /usr/local/bin/{binary} && chmod +x /usr/local/bin/{binary}\n"
-                )),
+                ExtractMethod::Tar => writeln!(
+                    d,
+                    " && \\\n    tar -xzf /tmp/dl -C /usr/local/bin {binary} && \\\n    rm /tmp/dl && chmod +x /usr/local/bin/{binary}"
+                ).unwrap(),
+                ExtractMethod::Zip => writeln!(
+                    d,
+                    " && \\\n    unzip /tmp/dl -d /tmp/ex && \\\n    mv /tmp/ex/{binary} /usr/local/bin/ && \\\n    rm -rf /tmp/dl /tmp/ex && chmod +x /usr/local/bin/{binary}"
+                ).unwrap(),
+                ExtractMethod::None => writeln!(
+                    d,
+                    " && \\\n    mv /tmp/dl /usr/local/bin/{binary} && chmod +x /usr/local/bin/{binary}"
+                ).unwrap(),
             }
         }
         InstallConfig::Npx => {
@@ -106,7 +120,7 @@ fn generate_dockerfile(cfg: &ServerConfig) -> Option<String> {
         }
     }
 
-    d.push_str(&format!("\nENTRYPOINT [\"{}\"]\n", cfg.command));
+    writeln!(d, "\nENTRYPOINT [\"{}\"]", cfg.command).unwrap();
     Some(d)
 }
 

@@ -9,10 +9,37 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// Config-specific error type
+// ---------------------------------------------------------------------------
+
+/// Errors specific to config file operations.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("reading {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("parsing {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("writing {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("serializing config: {0}")]
+    Serialize(#[from] serde_json::Error),
+}
+
+type Result<T, E = ConfigError> = std::result::Result<T, E>;
 
 /// Relative config directory under the user's home.
 const CONFIG_DIR: &str = ".config/mcp-proxy";
@@ -34,10 +61,15 @@ pub fn init_config(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating config dir {}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| ConfigError::Write {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
     }
-    std::fs::write(path, STARTER_CONFIG).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, STARTER_CONFIG).map_err(|e| ConfigError::Write {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     Ok(Some(path.to_path_buf()))
 }
 
@@ -177,12 +209,10 @@ impl Default for ServerConfig {
     }
 }
 
-impl ServerConfig {
-    /// A server is disabled if its name starts with `_` or its env toggle
-    /// evaluates to `false` / `0`.
-    pub fn is_disabled(&self, name: &str) -> bool {
-        name.starts_with('_') || is_toggled_off(self.env_toggle.as_deref())
-    }
+/// A server is disabled if its name starts with `_` or its env toggle
+/// evaluates to `false` / `0`.
+pub fn is_server_disabled(name: &str, cfg: &ServerConfig) -> bool {
+    name.starts_with('_') || is_toggled_off(cfg.env_toggle.as_deref())
 }
 
 fn default_true() -> bool {
@@ -344,7 +374,7 @@ impl Config {
     pub fn active_server_names(&self) -> Vec<String> {
         self.servers
             .iter()
-            .filter(|(n, srv)| !srv.is_disabled(n))
+            .filter(|(n, srv)| !is_server_disabled(n, srv))
             .map(|(n, _)| n.clone())
             .collect()
     }
@@ -356,18 +386,29 @@ impl Config {
 
 /// Load and parse a JSON file into `T`.
 pub fn load_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    serde_json::from_str(&raw).map_err(|e| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source: e,
+    })
 }
 
 /// Save `T` as pretty-printed JSON with a trailing newline.
 pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|e| ConfigError::Write {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
     }
-    std::fs::write(path, format!("{json}\n")).with_context(|| format!("writing {}", path.display()))
+    std::fs::write(path, format!("{json}\n")).map_err(|e| ConfigError::Write {
+        path: path.to_path_buf(),
+        source: e,
+    })
 }
 
 /// Load and parse the servers config file.

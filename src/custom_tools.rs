@@ -24,18 +24,20 @@ pub struct CustomTools {
 }
 
 impl CustomTools {
-    pub fn new(configs: &HashMap<String, CustomToolConfig>) -> Self {
-        let mut tools = HashMap::new();
-        for (name, cfg) in configs {
-            if name.starts_with('_') {
-                continue;
-            }
-            if is_toggled_off(cfg.env_toggle()) {
-                warn!("skipping custom tool {name} (toggled off)");
-                continue;
-            }
-            tools.insert(name.clone(), cfg.clone());
-        }
+    pub fn new(configs: HashMap<String, CustomToolConfig>) -> Self {
+        let tools: HashMap<String, CustomToolConfig> = configs
+            .into_iter()
+            .filter(|(name, cfg)| {
+                if name.starts_with('_') {
+                    return false;
+                }
+                if is_toggled_off(cfg.env_toggle()) {
+                    warn!("skipping custom tool {name} (toggled off)");
+                    return false;
+                }
+                true
+            })
+            .collect();
         info!("loaded {} custom tool(s)", tools.len());
         Self {
             tools,

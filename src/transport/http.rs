@@ -5,8 +5,9 @@
 //! - `DELETE /mcp` — session teardown
 //! - `GET  /health` — health check endpoint
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -16,17 +17,30 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::Value;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::jsonrpc;
 use crate::server::{BackendProgress, Hub};
 use crate::transport::{content_types, headers};
 
-/// Active session IDs. We only need to track existence for DELETE cleanup;
-/// per-request headers (`X-MCP-Servers`, `X-MCP-Env`) are decoded fresh
-/// on every request so the session struct carries no stale data.
-type Sessions = Arc<RwLock<HashSet<String>>>;
+// ---------------------------------------------------------------------------
+// Session tracking with TTL
+// ---------------------------------------------------------------------------
+
+/// Default session idle timeout (30 minutes).
+const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Default maximum concurrent sessions. 0 = unlimited.
+const MAX_SESSIONS: usize = 100;
+
+/// A tracked session with last-activity timestamp.
+struct SessionEntry {
+    last_active: Instant,
+}
+
+/// Active sessions with TTL tracking.
+type Sessions = Arc<RwLock<HashMap<String, SessionEntry>>>;
 
 #[derive(Clone)]
 struct AppState {
@@ -35,34 +49,77 @@ struct AppState {
     port: u16,
 }
 
-/// Decode the X-MCP-Env header: base64-encoded JSON map of env vars.
-fn decode_env_header(headers: &HeaderMap) -> HashMap<String, String> {
-    headers
-        .get(headers::ENV)
-        .and_then(|v| v.to_str().ok())
-        .map(super::decode_env_header)
-        .unwrap_or_default()
+/// Per-request client context decoded from MCP headers.
+///
+/// Bundles env overrides, server filter, and session ID so handlers don't
+/// have to decode multiple headers independently.
+struct ClientContext {
+    env_overrides: HashMap<String, String>,
+    servers: Vec<String>,
 }
 
-/// Decode X-MCP-Servers header: comma-separated list of server names.
-fn decode_servers_header(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get(headers::SERVERS)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            s.split(',')
-                .map(|n| n.trim().to_string())
-                .filter(|n| !n.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+impl ClientContext {
+    /// Decode all per-client headers in one pass.
+    fn from_headers(hdrs: &HeaderMap) -> Self {
+        let env_overrides = hdrs
+            .get(headers::ENV)
+            .and_then(|v| v.to_str().ok())
+            .map(super::decode_env_header)
+            .unwrap_or_default();
+        let servers = hdrs
+            .get(headers::SERVERS)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| {
+                s.split(',')
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            env_overrides,
+            servers,
+        }
+    }
 }
 
 /// Start the Streamable-HTTP MCP server on the given port.
 pub async fn serve(hub: Arc<Hub>, port: u16) -> anyhow::Result<()> {
+    let sessions: Sessions = Arc::default();
+
+    // Background reaper: every 60s, evict sessions idle longer than SESSION_TTL.
+    {
+        let sessions = sessions.clone();
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let expired: Vec<String> = {
+                    let map = sessions.read().await;
+                    map.iter()
+                        .filter(|(_, e)| e.last_active.elapsed() > SESSION_TTL)
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                };
+                if !expired.is_empty() {
+                    let mut map = sessions.write().await;
+                    for id in &expired {
+                        map.remove(id);
+                    }
+                    drop(map);
+                    for id in &expired {
+                        debug!(session = %id, "session expired (idle)");
+                        hub.cleanup_session(id).await;
+                    }
+                }
+            }
+        });
+    }
+
     let state = AppState {
         hub,
-        sessions: Arc::default(),
+        sessions,
         port,
     };
 
@@ -97,8 +154,7 @@ async fn handle_mcp(
     Json(req): Json<Value>,
 ) -> Response {
     // Decode per-client headers
-    let env_overrides = decode_env_header(&headers);
-    let servers = decode_servers_header(&headers);
+    let ctx = ClientContext::from_headers(&headers);
 
     // Resolve or create session — reject unknown session IDs to prevent
     // hijacking of per-session backends.
@@ -108,14 +164,31 @@ async fn handle_mcp(
         .map(String::from)
     {
         Some(id) => {
-            if !state.sessions.read().await.contains(&id) {
-                return (StatusCode::NOT_FOUND, "unknown session").into_response();
+            let mut map = state.sessions.write().await;
+            match map.get_mut(&id) {
+                Some(entry) => {
+                    entry.last_active = Instant::now();
+                }
+                None => {
+                    return (StatusCode::NOT_FOUND, "unknown session").into_response();
+                }
             }
             id
         }
         None => {
+            let mut map = state.sessions.write().await;
+            if MAX_SESSIONS > 0 && map.len() >= MAX_SESSIONS {
+                warn!(max = MAX_SESSIONS, "session limit reached");
+                return (StatusCode::SERVICE_UNAVAILABLE, "too many active sessions")
+                    .into_response();
+            }
             let id = Uuid::new_v4().to_string();
-            state.sessions.write().await.insert(id.clone());
+            map.insert(
+                id.clone(),
+                SessionEntry {
+                    last_active: Instant::now(),
+                },
+            );
             id
         }
     };
@@ -132,7 +205,13 @@ async fn handle_mcp(
     let Some(req_id) = id else {
         let _ = state
             .hub
-            .handle_request(&method, params, &servers, &env_overrides, &session_id)
+            .handle_request(
+                &method,
+                params,
+                &ctx.servers,
+                &ctx.env_overrides,
+                &session_id,
+            )
             .await;
         return (StatusCode::ACCEPTED, "").into_response();
     };
@@ -141,8 +220,8 @@ async fn handle_mcp(
     if method == "tools/list" {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<BackendProgress>(32);
         let hub = state.hub.clone();
-        let servers = servers.clone();
-        let env_overrides = env_overrides.clone();
+        let servers = ctx.servers.clone();
+        let env_overrides = ctx.env_overrides.clone();
         let sid = session_id.clone();
         let rid = req_id.clone();
 
@@ -208,7 +287,13 @@ async fn handle_mcp(
 
     let result = state
         .hub
-        .handle_request(&method, params, &servers, &env_overrides, &session_id)
+        .handle_request(
+            &method,
+            params,
+            &ctx.servers,
+            &ctx.env_overrides,
+            &session_id,
+        )
         .await;
 
     let body = match result {
@@ -238,7 +323,7 @@ async fn handle_mcp_delete(State(state): State<AppState>, headers: HeaderMap) ->
     };
 
     // Remove session
-    let removed = state.sessions.write().await.remove(&session_id);
+    let removed = state.sessions.write().await.remove(&session_id).is_some();
     if !removed {
         return (StatusCode::NOT_FOUND, "unknown session").into_response();
     }
