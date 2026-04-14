@@ -56,29 +56,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: ProfileCmd,
     },
-    /// Generate Dockerfile and .env.example from config
-    Generate {
-        /// What to generate: all, dockerfile, env
-        #[arg(default_value = "all")]
-        target: String,
-        /// Project directory (where Dockerfile is written)
-        #[arg(short, long, default_value = ".")]
-        dir: PathBuf,
-    },
     /// Interactive: select which clients to install to
     Clients {
         #[arg(short, long, default_value_t = 3000)]
         port: u16,
     },
-    /// Show status of client installations
-    Status,
-    /// Sync installed clients to current config
-    Sync {
-        #[arg(short, long, default_value_t = 3000)]
-        port: u16,
-    },
-    /// Remove mcp-proxy from all clients
-    Uninstall,
     /// Check health of a running hub
     Health {
         #[arg(short, long, default_value_t = 3000)]

@@ -4,7 +4,6 @@ mod clients;
 mod config;
 mod custom_tools;
 mod docker;
-mod generate;
 mod server;
 mod transport;
 
@@ -44,15 +43,9 @@ async fn main() -> Result<()> {
             let p = bridge_profile.as_deref().or(profile.as_deref());
             transport::bridge::run(&url, p, &servers, &forward_env, &args.config).await
         }
-        cli::Cmd::Generate { target, dir } => {
-            cmd_generate(&args.config, profile.as_deref(), &target, &dir)
-        }
         cli::Cmd::Server { action } => cmd_server(&args.config, action),
         cli::Cmd::Profile { action } => cmd_profile(&args.config, action),
         cli::Cmd::Clients { port } => cmd_clients(port, profile.as_deref()),
-        cli::Cmd::Status => cmd_status(),
-        cli::Cmd::Sync { port } => cmd_sync(port, profile.as_deref()),
-        cli::Cmd::Uninstall => cmd_uninstall(),
         cli::Cmd::Health { port } => cmd_health(port).await,
         cli::Cmd::Init => cmd_init(&args.config),
     }
@@ -95,25 +88,6 @@ async fn cmd_serve(
     }
 }
 
-fn cmd_generate(
-    config_path: &std::path::Path,
-    profile: Option<&str>,
-    target: &str,
-    dir: &std::path::Path,
-) -> Result<()> {
-    // Generate uses the full (unresolved) config for Dockerfile since it needs all servers
-    let cfg = config::load(config_path)?;
-    let _ = profile; // profiles don't affect generation (we want all servers in Docker)
-    match target {
-        "dockerfile" => generate::dockerfile(&cfg, &dir.join("Dockerfile")),
-        "env" => generate::env_example(&cfg, &dir.join(".env.example")),
-        _ => {
-            generate::dockerfile(&cfg, &dir.join("Dockerfile"))?;
-            generate::env_example(&cfg, &dir.join(".env.example"))
-        }
-    }
-}
-
 fn cmd_clients(port: u16, profile: Option<&str>) -> Result<()> {
     let all = clients::known_clients();
     let available: Vec<_> = all.iter().filter(|c| clients::is_available(c)).collect();
@@ -146,8 +120,11 @@ fn cmd_clients(port: u16, profile: Option<&str>) -> Result<()> {
 
     for (i, client) in available.iter().enumerate() {
         if selected_set.contains(&i) {
-            if !clients::is_installed(client) {
-                clients::install(client, port, &self_exe, profile, &[])?;
+            let was_installed = clients::is_installed(client);
+            clients::install(client, port, &self_exe, profile, &[])?;
+            if was_installed {
+                eprintln!("  🔄 synced {}", client.name);
+            } else {
                 eprintln!("  ✅ installed to {}", client.name);
             }
         } else if clients::is_installed(client) {
@@ -159,54 +136,51 @@ fn cmd_clients(port: u16, profile: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status() -> Result<()> {
-    eprintln!("\n📊 mcp-proxy status\n");
-    for client in &clients::known_clients() {
-        let avail = clients::is_available(client);
-        let inst = avail && clients::is_installed(client);
-        let icon = if !avail {
-            "⚪ not found"
-        } else if inst {
-            "✅ installed"
-        } else {
-            "❌ not installed"
-        };
-        eprintln!("  {:<20} {icon}", client.name);
-    }
-    Ok(())
-}
-
-fn cmd_sync(port: u16, profile: Option<&str>) -> Result<()> {
-    let self_exe = std::env::current_exe()?.display().to_string();
-    for client in &clients::known_clients() {
-        if !clients::is_installed(client) {
-            continue;
-        }
-        clients::install(client, port, &self_exe, profile, &[])?;
-        eprintln!("  🔧 synced {}", client.name);
-    }
-    Ok(())
-}
-
-fn cmd_uninstall() -> Result<()> {
-    for client in &clients::known_clients() {
-        if clients::uninstall(client)? {
-            eprintln!("  ✅ removed from {}", client.name);
-        }
-    }
-    Ok(())
-}
-
 async fn cmd_health(port: u16) -> Result<()> {
     let url = format!("http://localhost:{port}/health");
     let resp = reqwest::get(&url).await;
     match resp {
         Ok(r) if r.status().is_success() => {
             let data: serde_json::Value = r.json().await?;
-            eprintln!("✅ hub healthy\n{}", serde_json::to_string_pretty(&data)?);
+
+            eprintln!("✅ hub is running (port {port})\n");
+
+            if let Some(backends) = data.get("backends").and_then(|b| b.as_array()) {
+                if backends.is_empty() {
+                    eprintln!("  no backends running");
+                } else {
+                    eprintln!(
+                        "  {:<20} {:<12} {:<8} {:<6} IDLE",
+                        "NAME", "SCOPE", "READY", "TOOLS"
+                    );
+                    eprintln!("  {}", "─".repeat(60));
+                    for be in backends {
+                        let name = be.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let scope = be.get("scope").and_then(|v| v.as_str()).unwrap_or("?");
+                        let ready = if be.get("ready").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            "✓"
+                        } else {
+                            "✗"
+                        };
+                        let tools = be.get("tools").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let idle = match be.get("idle_secs").and_then(|v| v.as_u64()) {
+                            Some(s) if s >= 60 => format!("{}m", s / 60),
+                            Some(s) => format!("{s}s"),
+                            None => "—".to_string(),
+                        };
+                        eprintln!("  {name:<20} {scope:<12} {ready:<8} {tools:<6} {idle}");
+                    }
+                }
+            }
+
+            let sessions = data
+                .get("session_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            eprintln!("\n  active sessions: {sessions}");
         }
         Ok(r) => eprintln!("❌ HTTP {}", r.status()),
-        Err(e) => eprintln!("❌ cannot reach {url}: {e}"),
+        Err(e) => eprintln!("❌ cannot reach hub at {url}: {e}"),
     }
     Ok(())
 }
