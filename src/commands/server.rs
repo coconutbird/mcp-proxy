@@ -1,0 +1,136 @@
+//! `mcp-proxy server` — manage servers in the config.
+
+use std::collections::HashMap;
+
+use anyhow::Result;
+
+use crate::cli::ServerCmd;
+use crate::config;
+
+pub fn run(config_path: &std::path::Path, action: ServerCmd) -> Result<()> {
+    match action {
+        ServerCmd::List => {
+            let cfg = config::load(config_path)?;
+            if cfg.servers.is_empty() {
+                eprintln!("no servers configured");
+                return Ok(());
+            }
+            for (name, srv) in &cfg.servers {
+                let install_info = match &srv.install {
+                    Some(config::InstallConfig::Npm { package }) => format!(" (npm: {package})"),
+                    Some(config::InstallConfig::Pip { package }) => format!(" (pip: {package})"),
+                    Some(config::InstallConfig::Binary { binary, .. }) => {
+                        format!(" (binary: {binary})")
+                    }
+                    Some(config::InstallConfig::Npx) => " (npx)".to_string(),
+                    None => String::new(),
+                };
+                let rt = if srv.install.is_some() {
+                    match srv.runtime {
+                        config::Runtime::Docker => " [docker]",
+                        config::Runtime::Local => " [local]",
+                    }
+                } else {
+                    ""
+                };
+                eprintln!("  {name:<20} {}{install_info}{rt}", srv.command);
+            }
+            Ok(())
+        }
+        ServerCmd::Add {
+            name,
+            command,
+            args,
+            env,
+            npm,
+            pip,
+            runtime,
+        } => {
+            let mut cfg = config::load(config_path)?;
+            if cfg.servers.contains_key(&name) {
+                anyhow::bail!("server '{name}' already exists — use `server edit` to modify it");
+            }
+
+            let install = match (npm, pip) {
+                (Some(pkg), _) => Some(config::InstallConfig::Npm { package: pkg }),
+                (_, Some(pkg)) => Some(config::InstallConfig::Pip { package: pkg }),
+                _ => None,
+            };
+
+            let rt = match runtime.as_deref() {
+                Some("local") => config::Runtime::Local,
+                _ => config::Runtime::Docker,
+            };
+
+            cfg.servers.insert(
+                name.clone(),
+                config::ServerConfig {
+                    install,
+                    runtime: rt,
+                    command,
+                    args,
+                    env: env.into_iter().collect(),
+                    env_toggle: None,
+                    shared: Default::default(),
+                    timeout_secs: None,
+                    idle_timeout_secs: None,
+                    auto_restart: true,
+                    max_restarts: None,
+                    include_tools: Vec::new(),
+                    exclude_tools: Vec::new(),
+                    tool_aliases: HashMap::new(),
+                },
+            );
+
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ added server '{name}'");
+            Ok(())
+        }
+        ServerCmd::Remove { name } => {
+            let mut cfg = config::load(config_path)?;
+            if cfg.servers.remove(&name).is_none() {
+                anyhow::bail!("server '{name}' not found");
+            }
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ removed server '{name}'");
+            Ok(())
+        }
+        ServerCmd::Edit {
+            name,
+            command,
+            args,
+            env,
+            remove_env,
+            runtime,
+        } => {
+            let mut cfg = config::load(config_path)?;
+            let srv = cfg
+                .servers
+                .get_mut(&name)
+                .ok_or_else(|| anyhow::anyhow!("server '{name}' not found"))?;
+
+            if let Some(cmd) = command {
+                srv.command = cmd;
+            }
+            if let Some(a) = args {
+                srv.args = a;
+            }
+            for (k, v) in env {
+                srv.env.insert(k, v);
+            }
+            for k in remove_env {
+                srv.env.remove(&k);
+            }
+            if let Some(rt) = runtime {
+                srv.runtime = match rt.as_str() {
+                    "local" => config::Runtime::Local,
+                    _ => config::Runtime::Docker,
+                };
+            }
+
+            config::save(config_path, &cfg)?;
+            eprintln!("✅ updated server '{name}'");
+            Ok(())
+        }
+    }
+}

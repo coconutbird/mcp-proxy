@@ -1,11 +1,20 @@
+//! Lightweight custom tools defined inline in the config file.
+//!
+//! Custom tools run a shell command or HTTP request instead of going through
+//! a full MCP server subprocess. They're prefixed with [`CUSTOM_TOOL_PREFIX`]
+//! to avoid name collisions with backend-provided tools.
+
 use std::collections::HashMap;
 
 use anyhow::Result;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::backend::Tool;
 use crate::config::{CustomToolConfig, is_toggled_off};
+
+/// Prefix applied to custom tool names (e.g. `custom_my_tool`).
+pub const CUSTOM_TOOL_PREFIX: &str = "custom_";
 
 /// Executor for lightweight custom tools (shell / http) defined in config.
 pub struct CustomTools {
@@ -34,7 +43,7 @@ impl CustomTools {
         self.tools
             .iter()
             .map(|(name, cfg)| Tool {
-                name: format!("custom_{name}"),
+                name: format!("{CUSTOM_TOOL_PREFIX}{name}"),
                 description: Some(cfg.description().into()),
                 input_schema: Some(cfg.input_schema().clone()),
                 original_name: name.clone(),
@@ -43,16 +52,18 @@ impl CustomTools {
             .collect()
     }
 
+    /// Check whether `prefixed_name` (e.g. `custom_foo`) is a custom tool.
     pub fn has(&self, prefixed_name: &str) -> bool {
         let key = prefixed_name
-            .strip_prefix("custom_")
+            .strip_prefix(CUSTOM_TOOL_PREFIX)
             .unwrap_or(prefixed_name);
         self.tools.contains_key(key)
     }
 
+    /// Execute a custom tool by its prefixed name.
     pub async fn call(&self, prefixed_name: &str, args: &Value) -> Result<Value> {
         let key = prefixed_name
-            .strip_prefix("custom_")
+            .strip_prefix(CUSTOM_TOOL_PREFIX)
             .unwrap_or(prefixed_name);
         let cfg = self
             .tools
@@ -103,7 +114,7 @@ fn substitute(template: &str, args: &serde_json::Map<String, Value>) -> String {
 
 async fn exec_shell(command: &str, args: &serde_json::Map<String, Value>) -> Result<Value> {
     let cmd = substitute(command, args);
-    eprintln!("[custom] exec: {cmd}");
+    debug!(cmd = %cmd, "custom tool exec");
     let output = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&cmd)
@@ -126,7 +137,7 @@ async fn exec_http(
 ) -> Result<Value> {
     let url = substitute(url_tpl, args);
     let method = method.unwrap_or("GET");
-    eprintln!("[custom] {method} {url}");
+    debug!(method = method, url = %url, "custom tool http");
 
     let client = reqwest::Client::new();
     let mut req = client.request(method.parse()?, &url);

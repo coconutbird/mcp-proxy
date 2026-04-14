@@ -1,4 +1,20 @@
+//! The Hub — central aggregation layer for MCP backends.
+//!
+//! The [`Hub`] manages a collection of [`Backend`] instances keyed by
+//! `(server_name, env_hash)`. It handles:
+//!
+//! - **Backend lifecycle**: spawning, reaping idle instances, crash recovery
+//! - **Tool routing**: mapping prefixed tool names to the right backend
+//! - **Hot config reload**: diffing old vs new configs, restarting changed backends
+//! - **Credential scoping**: clients with different API keys get separate backends
+//!
+//! Two transports (stdio and HTTP) both delegate to [`Hub::handle_request`]
+//! for a single unified JSON-RPC dispatch path.
+
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6,6 +22,91 @@ use anyhow::Result;
 use serde_json::Value;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
+
+use crate::backend::{Backend, Tool};
+use crate::config::{Config, ServerConfig, Sharing, is_toggled_off};
+use crate::custom_tools::CustomTools;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// MCP protocol version used in handshakes and initialize responses.
+pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Default env key for backends with no per-client env overrides.
+const DEFAULT_ENV_KEY: &str = "__default__";
+
+/// Session key prefix for per-session backends.
+const SESSION_KEY_PREFIX: &str = "session:";
+
+/// Env key prefix for credential-scoped backends.
+const ENV_KEY_PREFIX: &str = "env:";
+
+/// Session ID used for stdio transport (single implicit session).
+pub const STDIO_SESSION_ID: &str = "__stdio__";
+
+// ---------------------------------------------------------------------------
+// JSON-RPC error type
+// ---------------------------------------------------------------------------
+
+/// Structured error type for JSON-RPC responses.
+///
+/// Maps to standard JSON-RPC 2.0 error codes so HTTP and stdio transports
+/// can return proper error objects instead of generic -32000.
+#[derive(Debug)]
+pub enum RpcError {
+    /// -32601: Method not found.
+    MethodNotFound(String),
+    /// -32602: Invalid params (e.g. missing tool name).
+    InvalidParams(String),
+    /// -32002: Tool not found (server-defined error).
+    ToolNotFound(String),
+    /// -32000: Generic backend / internal error.
+    Internal(String),
+}
+
+impl RpcError {
+    pub fn code(&self) -> i64 {
+        match self {
+            Self::MethodNotFound(_) => -32601,
+            Self::InvalidParams(_) => -32602,
+            Self::ToolNotFound(_) => -32002,
+            Self::Internal(_) => -32000,
+        }
+    }
+
+    pub fn to_json(&self, id: &Value) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": self.code(), "message": self.to_string() }
+        })
+    }
+}
+
+impl fmt::Display for RpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MethodNotFound(m) => write!(f, "unsupported method: {m}"),
+            Self::InvalidParams(m) => write!(f, "{m}"),
+            Self::ToolNotFound(m) => write!(f, "unknown tool: {m}"),
+            Self::Internal(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+impl From<anyhow::Error> for RpcError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Progress events
+// ---------------------------------------------------------------------------
 
 /// Progress event sent while backends are starting up.
 #[derive(Debug, Clone)]
@@ -16,16 +117,12 @@ pub enum BackendProgress {
     Failed { server: String, error: String },
 }
 
-use crate::backend::{Backend, Tool};
-use crate::config::{Config, ServerConfig, Sharing, is_toggled_off};
-use crate::custom_tools::CustomTools;
-
 /// Default idle timeout if not configured per-server (15 min).
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// A single backend instance, keyed by (server_name, relevant_env_hash).
 struct BackendEntry {
-    backend: Backend,
+    backend: Arc<tokio::sync::Mutex<Backend>>,
     /// `None` = default instance (no env overrides, never reaped).
     last_used: Option<Instant>,
 }
@@ -33,12 +130,10 @@ struct BackendEntry {
 /// Composite key: server name + hash of only the env vars that server cares about.
 type BackendKey = (String, String);
 
-fn djb2_hash(s: &str) -> u64 {
-    let mut h: u64 = 5381;
-    for b in s.bytes() {
-        h = h.wrapping_mul(33).wrapping_add(b as u64);
-    }
-    h
+fn sip_hash(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// Extract the `${VAR}` references from a server config's env values and args.
@@ -82,21 +177,34 @@ fn backend_env_key(srv: &ServerConfig, env_overrides: &HashMap<String, String>) 
         })
         .collect();
     if relevant.is_empty() {
-        return "__default__".to_string();
+        return DEFAULT_ENV_KEY.to_string();
     }
     let s: String = relevant
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("\0");
-    format!("env:{:x}", djb2_hash(&s))
+    format!("{ENV_KEY_PREFIX}{:x}", sip_hash(&s))
+}
+
+/// Compute the env-key portion of a backend key based on sharing mode.
+fn sharing_env_key(
+    srv: &ServerConfig,
+    env_overrides: &HashMap<String, String>,
+    session_id: &str,
+) -> String {
+    match srv.shared {
+        Sharing::Global => DEFAULT_ENV_KEY.to_string(),
+        Sharing::Credentials => backend_env_key(srv, env_overrides),
+        Sharing::Session => format!("{SESSION_KEY_PREFIX}{session_id}"),
+    }
 }
 
 /// The aggregator: holds individual backend instances keyed by
 /// (server_name, relevant_env_hash). Two clients that share the same
 /// credentials for a given server will reuse the same backend process.
 pub struct Hub {
-    raw_config: RwLock<Config>,
+    raw_config: Arc<RwLock<Config>>,
     /// Individual backend instances keyed by (name, env_hash).
     backends: Arc<RwLock<HashMap<BackendKey, BackendEntry>>>,
     custom: RwLock<Arc<CustomTools>>,
@@ -169,7 +277,7 @@ impl Hub {
                     backends.insert(
                         (name, env_key),
                         BackendEntry {
-                            backend: be,
+                            backend: Arc::new(tokio::sync::Mutex::new(be)),
                             last_used: None,
                         },
                     );
@@ -192,21 +300,24 @@ impl Hub {
         }
 
         let custom = Arc::new(CustomTools::new(&raw_config.custom_tools));
-        let raw_config_for_reaper = raw_config.clone();
+        let raw_config = Arc::new(RwLock::new(raw_config));
         let backends = Arc::new(RwLock::new(backends));
 
-        // Background reaper: every 60s, kill instances idle > their configured timeout
-        let reaper = backends.clone();
+        // Background reaper: every 60s, kill instances idle > their configured timeout.
+        // Uses the shared Arc<RwLock<Config>> so hot-reloaded timeouts take effect.
+        let reaper_backends = backends.clone();
+        let reaper_config = raw_config.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                let mut map = reaper.write().await;
+                let cfg = reaper_config.read().await;
+                let mut map = reaper_backends.write().await;
                 let stale: Vec<BackendKey> = map
                     .iter()
                     .filter_map(|(key, entry)| {
                         let last = entry.last_used?;
-                        let idle_timeout = raw_config_for_reaper
+                        let idle_timeout = cfg
                             .servers
                             .get(&key.0)
                             .and_then(|s| s.idle_timeout_secs)
@@ -219,9 +330,10 @@ impl Hub {
                         }
                     })
                     .collect();
+                drop(cfg);
                 for key in stale {
-                    if let Some(mut entry) = map.remove(&key) {
-                        entry.backend.kill();
+                    if let Some(entry) = map.remove(&key) {
+                        entry.backend.lock().await.kill();
                         info!(server = %key.0, scope = %key.1, "reaped idle backend");
                     }
                 }
@@ -229,7 +341,7 @@ impl Hub {
         });
 
         Ok(Self {
-            raw_config: RwLock::new(raw_config),
+            raw_config,
             backends,
             custom: RwLock::new(custom),
         })
@@ -256,11 +368,7 @@ impl Hub {
                 .ok_or_else(|| anyhow::anyhow!("unknown server: {name}"))?
         };
 
-        let env_key = match srv.shared {
-            Sharing::Global => "__default__".to_string(),
-            Sharing::Credentials => backend_env_key(&srv, env_overrides),
-            Sharing::Session => format!("session:{session_id}"),
-        };
+        let env_key = sharing_env_key(&srv, env_overrides, session_id);
         let key: BackendKey = (name.to_string(), env_key.clone());
 
         // Fast path: already running, touch idle timer
@@ -299,7 +407,13 @@ impl Hub {
         };
 
         let mut map = self.backends.write().await;
-        map.insert(key.clone(), BackendEntry { backend, last_used });
+        map.insert(
+            key.clone(),
+            BackendEntry {
+                backend: Arc::new(tokio::sync::Mutex::new(backend)),
+                last_used,
+            },
+        );
         Ok(key)
     }
 
@@ -343,32 +457,23 @@ impl Hub {
         session_id: &str,
     ) -> Option<String> {
         let srv = cfg.servers.get(srv_name)?;
-        Some(match srv.shared {
-            Sharing::Global => "__default__".to_string(),
-            Sharing::Credentials => backend_env_key(srv, env_overrides),
-            Sharing::Session => format!("session:{session_id}"),
-        })
+        Some(sharing_env_key(srv, env_overrides, session_id))
     }
 
-    /// List tools, filtered by the client's server include list.
-    /// Empty `servers` = all servers.
-    /// Returns `(tools, errors)` — errors lists backends that failed to start.
-    pub async fn list_tools_for(
+    /// Collect tools from matching backends, touching idle timers.
+    /// Acquires map write lock briefly to update timestamps, reads tool
+    /// lists from each backend's own mutex without holding the map lock.
+    async fn collect_tools(
         &self,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
         session_id: &str,
-    ) -> (Vec<Tool>, Vec<(String, String)>) {
-        let errors = self
-            .ensure_backends(servers, env_overrides, session_id)
-            .await;
-
+    ) -> Vec<Tool> {
         let cfg = self.raw_config.read().await;
         let mut map = self.backends.write().await;
-        let mut out: Vec<Tool> = Vec::new();
+        let mut matched: Vec<Arc<tokio::sync::Mutex<Backend>>> = Vec::new();
 
         for ((srv_name, env_key), entry) in map.iter_mut() {
-            let be = &entry.backend;
             if !servers.is_empty() && !servers.contains(srv_name) {
                 continue;
             }
@@ -383,10 +488,34 @@ impl Hub {
             if entry.last_used.is_some() {
                 entry.last_used = Some(Instant::now());
             }
+            matched.push(entry.backend.clone());
+        }
+        drop(map);
+        drop(cfg);
+
+        let mut out: Vec<Tool> = Vec::new();
+        for be_arc in &matched {
+            let be = be_arc.lock().await;
             out.extend(be.tools.iter().cloned());
         }
         out.extend(self.custom.read().await.list());
-        (out, errors)
+        out
+    }
+
+    /// List tools, filtered by the client's server include list.
+    /// Empty `servers` = all servers.
+    /// Returns `(tools, errors)` — errors lists backends that failed to start.
+    pub async fn list_tools_for(
+        &self,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) -> (Vec<Tool>, Vec<(String, String)>) {
+        let errors = self
+            .ensure_backends(servers, env_overrides, session_id)
+            .await;
+        let tools = self.collect_tools(servers, env_overrides, session_id).await;
+        (tools, errors)
     }
 
     /// Streaming version of `list_tools_for` — starts all backends concurrently
@@ -424,7 +553,10 @@ impl Hub {
                     Ok(key) => {
                         let tool_count = {
                             let map = hub.backends.read().await;
-                            map.get(&key).map(|e| e.backend.tools.len()).unwrap_or(0)
+                            match map.get(&key) {
+                                Some(e) => e.backend.lock().await.tools.len(),
+                                None => 0,
+                            }
                         };
                         let _ = progress_tx
                             .send(BackendProgress::Ready {
@@ -458,33 +590,15 @@ impl Hub {
             }
         }
 
-        // Collect tools (same as list_tools_for)
-        let cfg = self.raw_config.read().await;
-        let mut map = self.backends.write().await;
-        let mut out: Vec<Tool> = Vec::new();
-        for ((srv_name, env_key), entry) in map.iter_mut() {
-            let be = &entry.backend;
-            if !servers.is_empty() && !servers.contains(srv_name) {
-                continue;
-            }
-            let expected = match Self::expected_key_with(&cfg, srv_name, env_overrides, session_id)
-            {
-                Some(k) => k,
-                None => continue,
-            };
-            if *env_key != expected {
-                continue;
-            }
-            if entry.last_used.is_some() {
-                entry.last_used = Some(Instant::now());
-            }
-            out.extend(be.tools.iter().cloned());
-        }
-        out.extend(self.custom.read().await.list());
-        (out, errors)
+        let tools = self.collect_tools(servers, env_overrides, session_id).await;
+        (tools, errors)
     }
 
     /// Route a tool call, respecting the client's server include list.
+    ///
+    /// Uses `srv_name` from the backend key to match tool prefixes — this
+    /// avoids locking each individual backend during the search. Only the
+    /// target backend is locked, and only after the map lock is released.
     pub async fn call_tool_for(
         &self,
         name: &str,
@@ -492,51 +606,111 @@ impl Hub {
         servers: &[String],
         env_overrides: &HashMap<String, String>,
         session_id: &str,
-    ) -> Result<Value> {
+    ) -> Result<Value, RpcError> {
         // Check custom tools first
         {
             let custom = self.custom.read().await;
             if custom.has(name) {
-                return custom.call(name, &args).await;
+                return custom.call(name, &args).await.map_err(RpcError::from);
             }
         }
 
-        // Find backend by prefix, checking include list.
-        let cfg = self.raw_config.read().await;
-        let mut map = self.backends.write().await;
-        for ((srv_name, env_key), entry) in map.iter_mut() {
-            if !servers.is_empty() && !servers.contains(srv_name) {
-                continue;
-            }
-            let expected = match Self::expected_key_with(&cfg, srv_name, env_overrides, session_id)
-            {
-                Some(k) => k,
-                None => continue,
-            };
-            if *env_key != expected {
-                continue;
-            }
-            let prefix = format!("{}_", entry.backend.name);
-            if let Some(original) = name.strip_prefix(&prefix) {
-                if entry.last_used.is_some() {
-                    entry.last_used = Some(Instant::now());
+        // Find the target backend using the server name from the key — no
+        // need to lock individual backends just to read `be.name`.
+        let (be_arc, original_name) = {
+            let cfg = self.raw_config.read().await;
+            let mut map = self.backends.write().await;
+            let mut found = None;
+
+            for ((srv_name, env_key), entry) in map.iter_mut() {
+                if !servers.is_empty() && !servers.contains(srv_name) {
+                    continue;
                 }
-                return entry.backend.call_tool(original, args).await;
+                let expected =
+                    match Self::expected_key_with(&cfg, srv_name, env_overrides, session_id) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                if *env_key != expected {
+                    continue;
+                }
+                // Match tool prefix using the server name from the key
+                let prefix = format!("{srv_name}_");
+                if let Some(original) = name.strip_prefix(&prefix) {
+                    if entry.last_used.is_some() {
+                        entry.last_used = Some(Instant::now());
+                    }
+                    found = Some((entry.backend.clone(), original.to_string()));
+                    break;
+                }
             }
-        }
 
-        anyhow::bail!("unknown tool: {name}");
-    }
+            match found {
+                Some(f) => f,
+                None => return Err(RpcError::ToolNotFound(name.to_string())),
+            }
+        };
 
-    // -- Convenience wrappers: all servers, no env overrides, stdio session --
-
-    pub async fn list_tools(&self) -> (Vec<Tool>, Vec<(String, String)>) {
-        self.list_tools_for(&[], &HashMap::new(), "__stdio__").await
-    }
-
-    pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value> {
-        self.call_tool_for(name, args, &[], &HashMap::new(), "__stdio__")
+        // Perform the RPC outside the map lock — only this backend is locked.
+        let mut be = be_arc.lock().await;
+        be.call_tool(&original_name, args)
             .await
+            .map_err(RpcError::from)
+    }
+
+    /// Unified JSON-RPC method dispatch for both stdio and HTTP transports.
+    ///
+    /// Returns `Result<Value, RpcError>` so transports can map errors to
+    /// the correct JSON-RPC error codes.
+    pub async fn handle_request(
+        &self,
+        method: &str,
+        params: Value,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) -> Result<Value, RpcError> {
+        match method {
+            "initialize" => Ok(serde_json::json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "mcp-proxy",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            })),
+            "notifications/initialized" => Ok(Value::Null),
+            "tools/list" => {
+                let (tools, errors) = self
+                    .list_tools_for(servers, env_overrides, session_id)
+                    .await;
+                let mut result = serde_json::json!({ "tools": tools });
+                if !errors.is_empty() {
+                    let err_list: Vec<Value> = errors
+                        .into_iter()
+                        .map(|(name, msg)| serde_json::json!({ "server": name, "error": msg }))
+                        .collect();
+                    result["_errors"] = Value::Array(err_list);
+                }
+                Ok(result)
+            }
+            "tools/call" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::InvalidParams("missing tool name".into()))?;
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                self.call_tool_for(name, args, servers, env_overrides, session_id)
+                    .await
+            }
+            "resources/list" | "resources/read" => Err(RpcError::MethodNotFound(
+                "resources are not supported by mcp-proxy".into(),
+            )),
+            "prompts/list" | "prompts/get" => Err(RpcError::MethodNotFound(
+                "prompts are not supported by mcp-proxy".into(),
+            )),
+            _ => Err(RpcError::MethodNotFound(method.to_string())),
+        }
     }
 
     /// Health summary for /health endpoint.
@@ -544,31 +718,30 @@ impl Hub {
     pub async fn health(&self) -> Value {
         let map = self.backends.read().await;
         let mut session_count = 0u64;
-        let entries: Vec<Value> = map
-            .iter()
-            .map(|((name, env_key), entry)| {
-                // Classify without leaking the raw key
-                let scope = if *env_key == "__default__" {
-                    "global"
-                } else if env_key.starts_with("env:") {
-                    "credentials"
-                } else {
-                    if env_key.starts_with("session:") {
-                        session_count += 1;
-                    }
-                    "session"
-                };
-                serde_json::json!({
-                    "name": name,
-                    "scope": scope,
-                    "ready": entry.backend.ready,
-                    "crashed": entry.backend.has_crashed(),
-                    "tools": entry.backend.tools.len(),
-                    "restarts": entry.backend.restart_count,
-                    "idle_secs": entry.last_used.map(|t| t.elapsed().as_secs()),
-                })
-            })
-            .collect();
+        let mut entries: Vec<Value> = Vec::new();
+
+        for ((name, env_key), entry) in map.iter() {
+            let scope = if *env_key == DEFAULT_ENV_KEY {
+                "global"
+            } else if env_key.starts_with(ENV_KEY_PREFIX) {
+                "credentials"
+            } else {
+                if env_key.starts_with(SESSION_KEY_PREFIX) {
+                    session_count += 1;
+                }
+                "session"
+            };
+            let be = entry.backend.lock().await;
+            entries.push(serde_json::json!({
+                "name": name,
+                "scope": scope,
+                "ready": be.ready,
+                "crashed": be.has_crashed(),
+                "tools": be.tools.len(),
+                "restarts": be.restart_count,
+                "idle_secs": entry.last_used.map(|t| t.elapsed().as_secs()),
+            }));
+        }
 
         serde_json::json!({
             "backends": entries,
@@ -578,7 +751,7 @@ impl Hub {
 
     /// Kill all backends belonging to a specific session.
     pub async fn cleanup_session(&self, session_id: &str) {
-        let session_key = format!("session:{session_id}");
+        let session_key = format!("{SESSION_KEY_PREFIX}{session_id}");
         let mut map = self.backends.write().await;
         let stale: Vec<BackendKey> = map
             .keys()
@@ -586,9 +759,9 @@ impl Hub {
             .cloned()
             .collect();
         for key in &stale {
-            if let Some(mut entry) = map.remove(key) {
+            if let Some(entry) = map.remove(key) {
                 info!("cleaning up {} for session {session_id}", key.0);
-                entry.backend.kill();
+                entry.backend.lock().await.kill();
             }
         }
     }
@@ -597,7 +770,7 @@ impl Hub {
     pub async fn shutdown(&self) {
         let mut map = self.backends.write().await;
         for entry in map.values_mut() {
-            entry.backend.kill();
+            entry.backend.lock().await.kill();
         }
     }
 
@@ -724,8 +897,8 @@ impl Hub {
         for name in &to_remove {
             let keys: Vec<BackendKey> = map.keys().filter(|(n, _)| n == name).cloned().collect();
             for key in keys {
-                if let Some(mut entry) = map.remove(&key) {
-                    entry.backend.kill();
+                if let Some(entry) = map.remove(&key) {
+                    entry.backend.lock().await.kill();
                 }
             }
             info!(server = %name, "removed");
@@ -733,9 +906,9 @@ impl Hub {
 
         // 2. Restart changed servers (kill default instance, re-spawn)
         for name in &to_restart {
-            let default_key = (name.clone(), "__default__".to_string());
-            if let Some(mut entry) = map.remove(&default_key) {
-                entry.backend.kill();
+            let default_key = (name.clone(), DEFAULT_ENV_KEY.to_string());
+            if let Some(entry) = map.remove(&default_key) {
+                entry.backend.lock().await.kill();
             }
             let Some(srv) = new_servers.get(name) else {
                 continue;
@@ -754,7 +927,7 @@ impl Hub {
                     map.insert(
                         (name.clone(), env_key),
                         BackendEntry {
-                            backend: be,
+                            backend: Arc::new(tokio::sync::Mutex::new(be)),
                             last_used: None,
                         },
                     );
@@ -782,7 +955,7 @@ impl Hub {
                     map.insert(
                         (name.clone(), env_key),
                         BackendEntry {
-                            backend: be,
+                            backend: Arc::new(tokio::sync::Mutex::new(be)),
                             last_used: None,
                         },
                     );
@@ -923,8 +1096,8 @@ mod tests {
     }
 
     #[test]
-    fn djb2_hash_deterministic() {
-        assert_eq!(djb2_hash("hello"), djb2_hash("hello"));
-        assert_ne!(djb2_hash("hello"), djb2_hash("world"));
+    fn sip_hash_deterministic() {
+        assert_eq!(sip_hash("hello"), sip_hash("hello"));
+        assert_ne!(sip_hash("hello"), sip_hash("world"));
     }
 }

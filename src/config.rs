@@ -1,3 +1,10 @@
+//! Configuration data model, loading, saving, and environment expansion.
+//!
+//! The primary config file (`servers.json`) defines the backend servers.
+//! A separate `profiles.json` stores client-side profiles with per-server
+//! overrides and include lists. A user-level `config.json` persists the
+//! active profile selection.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

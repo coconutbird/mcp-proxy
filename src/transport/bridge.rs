@@ -5,7 +5,6 @@
 //! the Docker container first.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::Result;
 use base64::Engine;
@@ -113,32 +112,21 @@ pub async fn run(
 
     info!(hub = url, "bridge ready");
 
-    // Shared session ID for signal handler access
-    let session_id_shared: Arc<tokio::sync::Mutex<Option<String>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-
-    // Spawn a ctrl+c handler that sends DELETE before exiting
-    {
-        let client = client.clone();
-        let url = url.to_string();
-        let sid = session_id_shared.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            warn!("interrupted (ctrl+c)");
-            let guard = sid.lock().await;
-            if let Some(ref id) = *guard {
-                info!(session = %id, "cleaning up session");
-                let _ = client
-                    .delete(&url)
-                    .header("mcp-session-id", id)
-                    .send()
-                    .await;
+    loop {
+        // Race the next input line against ctrl+c so we can clean up gracefully
+        // instead of calling process::exit which skips destructors.
+        let line = tokio::select! {
+            result = lines.next_line() => {
+                match result? {
+                    Some(l) => l,
+                    None => break, // EOF
+                }
             }
-            std::process::exit(0);
-        });
-    }
-
-    while let Some(line) = lines.next_line().await? {
+            _ = tokio::signal::ctrl_c() => {
+                warn!("interrupted (ctrl+c)");
+                break;
+            }
+        };
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -161,6 +149,12 @@ pub async fn run(
             req = req.header("x-mcp-servers", s);
         }
 
+        // Parse request id for error responses (JSON-RPC 2.0 requires it).
+        let req_id = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
+
         match req.body(line).send().await {
             Ok(mut resp) => {
                 let status = resp.status();
@@ -169,6 +163,7 @@ pub async fn run(
                     error!(status = %status, body = body, "hub returned error");
                     let err = serde_json::json!({
                         "jsonrpc": "2.0",
+                        "id": req_id,
                         "error": { "code": -32000, "message": format!("hub returned HTTP {status}") }
                     });
                     let out = serde_json::to_string(&err)?;
@@ -184,8 +179,7 @@ pub async fn run(
                     if session_id.is_none() && new_sid.is_some() {
                         info!("connected");
                     }
-                    session_id = new_sid.clone();
-                    *session_id_shared.lock().await = new_sid;
+                    session_id = new_sid;
                 }
 
                 let is_sse = resp
@@ -256,6 +250,7 @@ pub async fn run(
                 error!(error = %e, "request failed");
                 let err = serde_json::json!({
                     "jsonrpc": "2.0",
+                    "id": req_id,
                     "error": { "code": -32000, "message": format!("bridge error: {e}") }
                 });
                 let out = serde_json::to_string(&err)?;

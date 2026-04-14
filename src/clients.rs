@@ -1,3 +1,8 @@
+//! Editor/client auto-installation support.
+//!
+//! Detects known MCP clients (Claude Desktop, Claude CLI, Augment) and
+//! can install or remove the `mcp-proxy` bridge entry from their config files.
+
 use std::path::PathBuf;
 
 use anyhow::Result;

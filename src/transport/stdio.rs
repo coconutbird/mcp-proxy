@@ -1,3 +1,10 @@
+//! Stdio MCP transport — JSON-RPC over stdin/stdout.
+//!
+//! Each line on stdin is a JSON-RPC request; responses are written as
+//! single-line JSON to stdout. Used when the aggregator is launched as
+//! a subprocess by an MCP client.
+
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -5,13 +12,15 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{error, info};
 
-use crate::server::Hub;
+use crate::server::{Hub, STDIO_SESSION_ID};
 
 /// Run the aggregator over stdin/stdout (JSON-RPC, one message per line).
 pub async fn serve(hub: Arc<Hub>) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
+    let empty_env = HashMap::new();
+    let empty_servers: Vec<String> = Vec::new();
 
     info!("stdio transport ready");
 
@@ -37,7 +46,15 @@ pub async fn serve(hub: Arc<Hub>) -> Result<()> {
             .to_string();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-        let response = handle(&hub, &method, params).await;
+        let response = hub
+            .handle_request(
+                &method,
+                params,
+                &empty_servers,
+                &empty_env,
+                STDIO_SESSION_ID,
+            )
+            .await;
 
         // Only send a response if the request had an id (not a notification)
         if let Some(id) = id {
@@ -47,11 +64,7 @@ pub async fn serve(hub: Arc<Hub>) -> Result<()> {
                     "id": id,
                     "result": result,
                 }),
-                Err(e) => serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": { "code": -32000, "message": e.to_string() },
-                }),
+                Err(e) => e.to_json(&id),
             };
             let out = serde_json::to_string(&resp)?;
             stdout.write_all(out.as_bytes()).await?;
@@ -61,39 +74,4 @@ pub async fn serve(hub: Arc<Hub>) -> Result<()> {
     }
 
     Ok(())
-}
-
-async fn handle(hub: &Hub, method: &str, params: Value) -> Result<Value> {
-    match method {
-        "initialize" => Ok(serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": "mcp-proxy",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-        })),
-        "notifications/initialized" => Ok(Value::Null),
-        "tools/list" => {
-            let (tools, errors) = hub.list_tools().await;
-            let mut result = serde_json::json!({ "tools": tools });
-            if !errors.is_empty() {
-                let err_list: Vec<Value> = errors
-                    .into_iter()
-                    .map(|(name, msg)| serde_json::json!({ "server": name, "error": msg }))
-                    .collect();
-                result["_errors"] = Value::Array(err_list);
-            }
-            Ok(result)
-        }
-        "tools/call" => {
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
-            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-            hub.call_tool(name, args).await
-        }
-        _ => anyhow::bail!("unsupported method: {method}"),
-    }
 }

@@ -1,4 +1,12 @@
-use std::collections::HashMap;
+//! Streamable-HTTP MCP transport.
+//!
+//! Exposes the hub as an HTTP server with:
+//! - `POST /mcp` — JSON-RPC requests (with optional SSE streaming for `tools/list`)
+//! - `GET  /mcp` — SSE endpoint placeholder for server-initiated messages
+//! - `DELETE /mcp` — session teardown
+//! - `GET  /health` — health check endpoint
+
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -13,21 +21,12 @@ use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::server::BackendProgress;
+use crate::server::{BackendProgress, Hub};
 
-use crate::server::Hub;
-
-struct Session {
-    _id: String,
-    /// Per-client server include list from X-MCP-Servers header.
-    #[allow(dead_code)]
-    servers: Vec<String>,
-    /// Per-client env overrides decoded from X-MCP-Env header.
-    #[allow(dead_code)]
-    env_overrides: HashMap<String, String>,
-}
-
-type Sessions = Arc<RwLock<HashMap<String, Session>>>;
+/// Active session IDs. We only need to track existence for DELETE cleanup;
+/// per-request headers (`X-MCP-Servers`, `X-MCP-Env`) are decoded fresh
+/// on every request so the session struct carries no stale data.
+type Sessions = Arc<RwLock<HashSet<String>>>;
 
 #[derive(Clone)]
 struct AppState {
@@ -94,7 +93,7 @@ async fn handle_mcp(
     let env_overrides = decode_env_header(&headers);
     let servers = decode_servers_header(&headers);
 
-    // Resolve or create session
+    // Resolve or create session (we only track the ID for DELETE cleanup)
     let session_id = match headers
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
@@ -103,21 +102,8 @@ async fn handle_mcp(
         Some(id) => id,
         None => {
             let id = Uuid::new_v4().to_string();
-            let id_clone = id.clone();
-            let env_clone = env_overrides.clone();
-            let servers_clone = servers.clone();
-            let sessions = state.sessions.clone();
-            tokio::spawn(async move {
-                sessions.write().await.insert(
-                    id.clone(),
-                    Session {
-                        _id: id,
-                        servers: servers_clone,
-                        env_overrides: env_clone,
-                    },
-                );
-            });
-            id_clone
+            state.sessions.write().await.insert(id.clone());
+            id
         }
     };
 
@@ -131,15 +117,10 @@ async fn handle_mcp(
 
     // Notifications (no id) get 202 Accepted
     let Some(req_id) = id else {
-        let _ = handle_request(
-            &state.hub,
-            &method,
-            params,
-            &servers,
-            &env_overrides,
-            &session_id,
-        )
-        .await;
+        let _ = state
+            .hub
+            .handle_request(&method, params, &servers, &env_overrides, &session_id)
+            .await;
         return (StatusCode::ACCEPTED, "").into_response();
     };
 
@@ -205,22 +186,14 @@ async fn handle_mcp(
             .unwrap();
     }
 
-    let result = handle_request(
-        &state.hub,
-        &method,
-        params,
-        &servers,
-        &env_overrides,
-        &session_id,
-    )
-    .await;
+    let result = state
+        .hub
+        .handle_request(&method, params, &servers, &env_overrides, &session_id)
+        .await;
 
     let body = match result {
         Ok(val) => serde_json::json!({ "jsonrpc": "2.0", "id": req_id, "result": val }),
-        Err(e) => serde_json::json!({
-            "jsonrpc": "2.0", "id": req_id,
-            "error": { "code": -32000, "message": e.to_string() }
-        }),
+        Err(e) => e.to_json(&req_id),
     };
 
     Response::builder()
@@ -251,7 +224,7 @@ async fn handle_mcp_delete(State(state): State<AppState>, headers: HeaderMap) ->
     };
 
     // Remove session
-    let removed = state.sessions.write().await.remove(&session_id).is_some();
+    let removed = state.sessions.write().await.remove(&session_id);
     if !removed {
         return (StatusCode::NOT_FOUND, "unknown session").into_response();
     }
@@ -272,44 +245,4 @@ async fn handle_health(State(state): State<AppState>) -> Json<Value> {
         obj.insert("sessions".into(), state.sessions.read().await.len().into());
     }
     Json(health)
-}
-
-async fn handle_request(
-    hub: &Hub,
-    method: &str,
-    params: Value,
-    servers: &[String],
-    env_overrides: &HashMap<String, String>,
-    session_id: &str,
-) -> anyhow::Result<Value> {
-    match method {
-        "initialize" => Ok(serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "mcp-proxy", "version": env!("CARGO_PKG_VERSION") },
-        })),
-        "notifications/initialized" => Ok(Value::Null),
-        "tools/list" => {
-            let (tools, errors) = hub.list_tools_for(servers, env_overrides, session_id).await;
-            let mut result = serde_json::json!({ "tools": tools });
-            if !errors.is_empty() {
-                let err_list: Vec<Value> = errors
-                    .into_iter()
-                    .map(|(name, msg)| serde_json::json!({ "server": name, "error": msg }))
-                    .collect();
-                result["_errors"] = Value::Array(err_list);
-            }
-            Ok(result)
-        }
-        "tools/call" => {
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
-            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-            hub.call_tool_for(name, args, servers, env_overrides, session_id)
-                .await
-        }
-        _ => anyhow::bail!("unsupported method: {method}"),
-    }
 }

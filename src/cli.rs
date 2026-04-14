@@ -1,3 +1,8 @@
+//! Command-line argument definitions using [`clap`].
+//!
+//! All subcommand enums and their args are defined here, with no business
+//! logic. Actual command implementations live in [`crate::commands`].
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 

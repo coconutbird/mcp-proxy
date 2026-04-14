@@ -1,3 +1,12 @@
+//! MCP backend subprocess management.
+//!
+//! A [`Backend`] represents a single running MCP server process. It handles:
+//! - Process spawning (local or Docker)
+//! - JSON-RPC handshake and tool discovery
+//! - Request routing with timeouts
+//! - Crash detection and auto-restart with exponential backoff
+//! - Tool filtering (include/exclude globs) and aliasing
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -99,7 +108,7 @@ pub struct Backend {
     pending: Arc<Mutex<Pending>>,
     stdin: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
     timeout: Duration,
-    _child: Option<Child>,
+    child: Option<Child>,
     /// Stored so we can restart with the same params.
     cfg_snapshot: ServerConfig,
     extra_env_snapshot: HashMap<String, String>,
@@ -134,7 +143,7 @@ impl Backend {
             pending,
             stdin,
             timeout: Duration::from_secs(timeout_secs),
-            _child: Some(child),
+            child: Some(child),
             cfg_snapshot: cfg.clone(),
             extra_env_snapshot: extra_env.clone(),
         };
@@ -316,7 +325,7 @@ impl Backend {
 
         self.pending = pending;
         self.stdin = stdin;
-        self._child = Some(child);
+        self.child = Some(child);
 
         self.handshake().await?;
         self.apply_tool_filters();
@@ -457,7 +466,7 @@ impl Backend {
 
     /// Kill the child process.
     pub fn kill(&mut self) {
-        if let Some(ref mut c) = self._child {
+        if let Some(ref mut c) = self.child {
             let _ = c.start_kill();
         }
     }
