@@ -65,11 +65,14 @@ fn spawn_config_watcher(hub: Arc<Hub>, config_path: std::path::PathBuf) {
         .watch(&watch_dir, RecursiveMode::NonRecursive)
         .expect("failed to watch config directory");
 
+    // Capture the runtime handle while we're still on the tokio runtime —
+    // the spawned OS thread won't have a reactor context.
+    let rt = tokio::runtime::Handle::current();
+
     std::thread::Builder::new()
         .name("config-watcher".into())
         .spawn(move || {
             let _watcher = watcher; // prevent drop
-            let rt = tokio::runtime::Handle::current();
             let mut debounce: Option<std::time::Instant> = None;
 
             loop {
