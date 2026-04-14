@@ -55,32 +55,32 @@ See [`config/servers.example.json`](config/servers.example.json) for a full exam
 
 ### Server Options
 
-| Field              | Required | Default     | Description                                                        |
-| ------------------ | -------- | ----------- | ------------------------------------------------------------------ |
-| `command`          | yes      |             | Binary to run                                                      |
-| `args`             | no       | `[]`        | Command-line arguments                                             |
-| `env`              | no       | `{}`        | Environment variables (`${VAR}` expanded from process env)         |
-| `envToggle`        | no       |             | Env var name — set to `false` or `0` to disable this server       |
-| `shared`           | no       | `"session"` | Backend sharing mode: `session`, `credentials`, or `global`        |
-| `timeoutSecs`      | no       | `30`        | Per-tool RPC timeout in seconds                                    |
-| `idleTimeoutSecs`  | no       | `900`       | Seconds before an idle backend is reaped (15 min)                  |
-| `autoRestart`      | no       | `true`      | Restart the backend automatically on crash                         |
-| `maxRestarts`      | no       | `5`         | Maximum restart attempts before giving up                          |
-| `includeTools`     | no       | `[]`        | Glob patterns — only matching tools are exposed                    |
-| `excludeTools`     | no       | `[]`        | Glob patterns — matching tools are hidden (applied after include)  |
-| `toolAliases`      | no       | `{}`        | Rename tools: `{ "original_name": "new_name" }`                   |
-| `install`          | no       |             | Auto-install config (`npm`, `pip`, or `binary`)                    |
-| `runtime`          | no       | `"docker"`  | Where to run installed servers: `docker` or `local`                |
+| Field             | Required | Default     | Description                                                       |
+| ----------------- | -------- | ----------- | ----------------------------------------------------------------- |
+| `command`         | yes      |             | Binary to run                                                     |
+| `args`            | no       | `[]`        | Command-line arguments                                            |
+| `env`             | no       | `{}`        | Environment variables (`${VAR}` expanded from process env)        |
+| `envToggle`       | no       |             | Env var name — set to `false` or `0` to disable this server       |
+| `shared`          | no       | `"session"` | Backend sharing mode: `session`, `credentials`, or `global`       |
+| `timeoutSecs`     | no       | `30`        | Per-tool RPC timeout in seconds                                   |
+| `idleTimeoutSecs` | no       | `900`       | Seconds before an idle backend is reaped (15 min)                 |
+| `autoRestart`     | no       | `true`      | Restart the backend automatically on crash                        |
+| `maxRestarts`     | no       | `5`         | Maximum restart attempts before giving up                         |
+| `includeTools`    | no       | `[]`        | Glob patterns — only matching tools are exposed                   |
+| `excludeTools`    | no       | `[]`        | Glob patterns — matching tools are hidden (applied after include) |
+| `toolAliases`     | no       | `{}`        | Rename tools: `{ "original_name": "new_name" }`                   |
+| `install`         | no       |             | Auto-install config (`npm`, `pip`, or `binary`)                   |
+| `runtime`         | no       | `"docker"`  | Where to run installed servers: `docker` or `local`               |
 
 ### Sharing Modes
 
 Controls how backend processes are shared across client connections:
 
-| Mode          | Description                                                                 |
-| ------------- | --------------------------------------------------------------------------- |
-| `session`     | One process per client session — fully isolated (default)                   |
-| `credentials` | Shared across sessions with matching env vars for this server               |
-| `global`      | Single instance shared by all clients — never reaped                        |
+| Mode          | Description                                                   |
+| ------------- | ------------------------------------------------------------- |
+| `session`     | One process per client session — fully isolated (default)     |
+| `credentials` | Shared across sessions with matching env vars for this server |
+| `global`      | Single instance shared by all clients — never reaped          |
 
 ### Profiles
 
@@ -102,13 +102,19 @@ Define lightweight tools directly in config without a full MCP server:
     "ping": {
       "type": "shell",
       "description": "Ping a host",
-      "inputSchema": { "type": "object", "properties": { "host": { "type": "string" } } },
+      "inputSchema": {
+        "type": "object",
+        "properties": { "host": { "type": "string" } }
+      },
       "command": "ping -c 1 {{host}}"
     },
     "lookup": {
       "type": "http",
       "description": "Look up a domain",
-      "inputSchema": { "type": "object", "properties": { "domain": { "type": "string" } } },
+      "inputSchema": {
+        "type": "object",
+        "properties": { "domain": { "type": "string" } }
+      },
       "url": "https://api.example.com/lookup?domain={{domain}}"
     }
   }
@@ -143,7 +149,7 @@ Commands:
 mcp-proxy serve                          # HTTP on :3000
 mcp-proxy serve -p 8080                  # custom port
 mcp-proxy serve -t stdio                 # stdio mode (single client)
-mcp-proxy serve --profile work           # start with a profile
+mcp-proxy serve --profile work           # start with a set profile
 ```
 
 ### `bridge`
@@ -192,6 +198,8 @@ The entry written to each client config looks like:
 
 Supported clients: **Claude Desktop**, **Claude CLI**, **Augment**.
 
+> **Profile resolution:** When no `--profile` flag is passed, the bridge automatically uses the currently active profile (set via `mcp-proxy profile switch <name>` or the `MCP_PROFILE` env var). This means you can switch profiles once and all clients pick up the change on next connect — no need to re-run `clients`.
+
 ## Remote / Multi-User Setup
 
 Run `mcp-proxy serve` on a remote server. Clients connect via the bridge:
@@ -199,7 +207,13 @@ Run `mcp-proxy serve` on a remote server. Clients connect via the bridge:
 ```json
 {
   "command": "mcp-proxy",
-  "args": ["bridge", "--url", "http://remote:3000/mcp", "--forward-env", "GITHUB_TOKEN"],
+  "args": [
+    "bridge",
+    "--url",
+    "http://remote:3000/mcp",
+    "--forward-env",
+    "GITHUB_TOKEN"
+  ],
   "env": { "GITHUB_TOKEN": "ghp_my_token" }
 }
 ```
@@ -217,13 +231,13 @@ Returns JSON with per-backend status (ready, crashed, tool count, restart count)
 
 ## Environment Variables
 
-| Variable        | Description                                   |
-| --------------- | --------------------------------------------- |
-| `CONFIG_PATH`   | Path to `servers.json`                        |
-| `MCP_PROFILE`   | Default profile                               |
-| `MCP_PORT`      | HTTP port (default: `3000`)                   |
-| `MCP_TRANSPORT` | Transport mode: `http` or `stdio`             |
-| `MCP_BIND`      | Bind address (default: `127.0.0.1`)           |
+| Variable        | Description                         |
+| --------------- | ----------------------------------- |
+| `CONFIG_PATH`   | Path to `servers.json`              |
+| `MCP_PROFILE`   | Default profile                     |
+| `MCP_PORT`      | HTTP port (default: `3000`)         |
+| `MCP_TRANSPORT` | Transport mode: `http` or `stdio`   |
+| `MCP_BIND`      | Bind address (default: `127.0.0.1`) |
 
 ## Architecture
 
