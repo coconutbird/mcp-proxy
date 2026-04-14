@@ -178,13 +178,19 @@ mcp-proxy profile remove work
 
 ## Client Setup
 
-`mcp-proxy clients` interactively installs into detected MCP clients:
+`mcp-proxy clients` interactively installs into detected MCP clients. All clients use the **bridge** (stdio) transport — this gives clean session lifecycle, env forwarding, and graceful disconnect regardless of whether the client supports HTTP natively.
 
-| Client         | Transport | Config written                                                |
-| -------------- | --------- | ------------------------------------------------------------- |
-| Augment        | HTTP      | `{ "type": "http", "url": "http://localhost:3000/mcp" }`     |
-| Claude CLI     | HTTP      | Same as above                                                 |
-| Claude Desktop | stdio     | Bridge command: `mcp-proxy bridge --url http://localhost:3000/mcp` |
+The entry written to each client config looks like:
+
+```json
+{
+  "type": "stdio",
+  "command": "/path/to/mcp-proxy",
+  "args": ["bridge"]
+}
+```
+
+Supported clients: **Claude Desktop**, **Claude CLI**, **Augment**.
 
 ## Remote / Multi-User Setup
 
