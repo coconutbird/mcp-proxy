@@ -1,15 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::config::{ServerConfig, expand_env_with_overrides};
+
+/// Default RPC timeout if not configured per-server.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 #[derive(serde::Serialize)]
 struct Rpc<'a> {
@@ -47,6 +51,37 @@ pub struct Tool {
     pub backend_name: String,
 }
 
+/// Simple glob matcher supporting `*` wildcards.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    let mut rest = name;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !rest.starts_with(part) {
+                return false;
+            }
+            rest = &rest[part.len()..];
+        } else if i == parts.len() - 1 {
+            if !rest.ends_with(part) {
+                return false;
+            }
+            return true;
+        } else {
+            match rest.find(part) {
+                Some(pos) => rest = &rest[pos + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
 type Pending = HashMap<u64, oneshot::Sender<Result<Value>>>;
 
 /// A running MCP server subprocess managed by the hub.
@@ -54,10 +89,20 @@ pub struct Backend {
     pub name: String,
     pub tools: Vec<Tool>,
     pub ready: bool,
+    /// Number of times this backend has been restarted after a crash.
+    pub restart_count: u32,
+    /// Whether the process has exited unexpectedly.
+    crashed: Arc<AtomicBool>,
+    /// Notified when the process exits so callers can trigger restart.
+    exit_notify: Arc<Notify>,
     seq: AtomicU64,
     pending: Arc<Mutex<Pending>>,
     stdin: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
+    timeout: Duration,
     _child: Option<Child>,
+    /// Stored so we can restart with the same params.
+    cfg_snapshot: ServerConfig,
+    extra_env_snapshot: HashMap<String, String>,
 }
 
 impl Backend {
@@ -71,8 +116,45 @@ impl Backend {
         cfg: &ServerConfig,
         extra_env: &HashMap<String, String>,
     ) -> Result<Self> {
-        // Expand ${VAR} references against BOTH the hub's process env AND
-        // the client's forwarded env (client wins on conflict).
+        let timeout_secs = cfg.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let crashed = Arc::new(AtomicBool::new(false));
+        let exit_notify = Arc::new(Notify::new());
+
+        let (pending, stdin, child) =
+            Self::spawn_process(&name, cfg, extra_env, &crashed, &exit_notify).await?;
+
+        let mut be = Self {
+            name,
+            tools: Vec::new(),
+            ready: false,
+            restart_count: 0,
+            crashed,
+            exit_notify,
+            seq: AtomicU64::new(1),
+            pending,
+            stdin,
+            timeout: Duration::from_secs(timeout_secs),
+            _child: Some(child),
+            cfg_snapshot: cfg.clone(),
+            extra_env_snapshot: extra_env.clone(),
+        };
+        be.handshake().await?;
+        be.apply_tool_filters();
+        Ok(be)
+    }
+
+    /// Spawn the child process and wire up stdin/stdout/stderr.
+    async fn spawn_process(
+        name: &str,
+        cfg: &ServerConfig,
+        extra_env: &HashMap<String, String>,
+        crashed: &Arc<AtomicBool>,
+        exit_notify: &Arc<Notify>,
+    ) -> Result<(
+        Arc<Mutex<Pending>>,
+        Arc<Mutex<Option<tokio::process::ChildStdin>>>,
+        Child,
+    )> {
         let expand = |s: &str| expand_env_with_overrides(s, extra_env);
 
         let args: Vec<String> = cfg.args.iter().map(|a| expand(a)).collect();
@@ -81,8 +163,6 @@ impl Backend {
             .iter()
             .map(|(k, v)| (k.clone(), expand(v)))
             .collect();
-        // Also inject the raw client overrides so backends that read env
-        // vars directly (not via config ${} refs) still get them.
         for (k, v) in extra_env {
             env.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -92,8 +172,8 @@ impl Backend {
 
         let mut child = if use_docker {
             info!("[{name}] using Docker");
-            crate::docker::ensure_image(&name, cfg).await?;
-            crate::docker::run_container(&name, cfg, extra_env).await?
+            crate::docker::ensure_image(name, cfg).await?;
+            crate::docker::run_container(name, cfg, extra_env).await?
         } else {
             Command::new(&cfg.command)
                 .args(&args)
@@ -102,7 +182,14 @@ impl Backend {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
-                .map_err(|e| anyhow::anyhow!("spawn '{}' ({}): {e}", name, cfg.command))?
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to spawn '{name}': command '{}' — {e}\n\
+                         hint: is '{}' installed and on your PATH?",
+                        cfg.command,
+                        cfg.command
+                    )
+                })?
         };
 
         let child_stdin = child.stdin.take().unwrap();
@@ -113,7 +200,7 @@ impl Backend {
         let stdin = Arc::new(Mutex::new(Some(child_stdin)));
 
         // Drain stderr to the hub stderr
-        let tag = name.clone();
+        let tag = name.to_string();
         tokio::spawn(async move {
             let mut lines = BufReader::new(child_stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -121,9 +208,12 @@ impl Backend {
             }
         });
 
-        // Route stdout JSON-RPC responses to pending futures
+        // Route stdout JSON-RPC responses to pending futures.
+        // When stdout closes (process exit), mark as crashed and notify.
         let p = pending.clone();
-        let tag = name.clone();
+        let tag = name.to_string();
+        let crash_flag = crashed.clone();
+        let notify = exit_notify.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(child_stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -140,19 +230,101 @@ impl Backend {
                     let _ = tx.send(val);
                 }
             }
+            // stdout closed → process exited
+            crash_flag.store(true, Ordering::Relaxed);
+            notify.notify_waiters();
+            warn!("[{tag}] process exited (stdout closed)");
         });
 
-        let mut be = Self {
-            name,
-            tools: Vec::new(),
-            ready: false,
-            seq: AtomicU64::new(1),
-            pending,
-            stdin,
-            _child: Some(child),
-        };
-        be.handshake().await?;
-        Ok(be)
+        Ok((pending, stdin, child))
+    }
+
+    /// Apply include/exclude tool filters and aliases from the config.
+    fn apply_tool_filters(&mut self) {
+        let cfg = &self.cfg_snapshot;
+
+        // Apply include filter
+        if !cfg.include_tools.is_empty() {
+            self.tools.retain(|t| {
+                cfg.include_tools
+                    .iter()
+                    .any(|pat| glob_match(pat, &t.original_name))
+            });
+        }
+
+        // Apply exclude filter
+        if !cfg.exclude_tools.is_empty() {
+            self.tools.retain(|t| {
+                !cfg.exclude_tools
+                    .iter()
+                    .any(|pat| glob_match(pat, &t.original_name))
+            });
+        }
+
+        // Apply aliases: add aliased copies of tools
+        let mut aliased: Vec<Tool> = Vec::new();
+        for (alias, original) in &cfg.tool_aliases {
+            if let Some(t) = self.tools.iter().find(|t| t.original_name == *original) {
+                let mut cloned = t.clone();
+                cloned.name = format!("{}_{alias}", self.name);
+                aliased.push(cloned);
+            }
+        }
+        self.tools.extend(aliased);
+    }
+
+    /// Returns true if the backend process has crashed.
+    pub fn has_crashed(&self) -> bool {
+        self.crashed.load(Ordering::Relaxed)
+    }
+
+    /// Attempt to restart the backend after a crash.
+    /// Returns an error if max restarts exceeded or restart fails.
+    pub async fn try_restart(&mut self) -> Result<()> {
+        let max = self.cfg_snapshot.max_restarts.unwrap_or(5);
+        if self.restart_count >= max {
+            bail!("[{}] max restarts ({max}) exceeded, giving up", self.name);
+        }
+
+        // Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped)
+        let delay = Duration::from_secs(1 << self.restart_count.min(4));
+        warn!(
+            "[{}] restarting in {:?} (attempt {}/{})",
+            self.name,
+            delay,
+            self.restart_count + 1,
+            max
+        );
+        tokio::time::sleep(delay).await;
+
+        // Kill old process if still around
+        self.kill();
+
+        // Reset crash state
+        self.crashed.store(false, Ordering::Relaxed);
+        self.ready = false;
+        self.restart_count += 1;
+
+        let (pending, stdin, child) = Self::spawn_process(
+            &self.name,
+            &self.cfg_snapshot,
+            &self.extra_env_snapshot,
+            &self.crashed,
+            &self.exit_notify,
+        )
+        .await?;
+
+        self.pending = pending;
+        self.stdin = stdin;
+        self._child = Some(child);
+
+        self.handshake().await?;
+        self.apply_tool_filters();
+        info!(
+            "[{}] restarted successfully (attempt {})",
+            self.name, self.restart_count
+        );
+        Ok(())
     }
 
     async fn handshake(&mut self) -> Result<()> {
@@ -164,7 +336,14 @@ impl Backend {
                 "clientInfo": { "name": "mcp-proxy", "version": env!("CARGO_PKG_VERSION") }
             }),
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "[{}] MCP handshake failed: {e}\nhint: is '{}' a valid MCP server?",
+                self.name,
+                self.cfg_snapshot.command
+            )
+        })?;
 
         self.notify("notifications/initialized", serde_json::json!({}))
             .await?;
@@ -199,6 +378,14 @@ impl Backend {
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+        // Check if process has crashed before trying
+        if self.crashed.load(Ordering::Relaxed) {
+            bail!(
+                "[{}] backend process has crashed — restart pending",
+                self.name
+            );
+        }
+
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         let msg = serde_json::to_string(&Rpc {
             jsonrpc: "2.0",
@@ -210,21 +397,26 @@ impl Backend {
         self.pending.lock().await.insert(id, tx);
         {
             let mut g = self.stdin.lock().await;
-            let w = g.as_mut().ok_or_else(|| anyhow::anyhow!("stdin closed"))?;
+            let w = g.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("[{}] stdin closed — backend may have crashed", self.name)
+            })?;
             w.write_all(msg.as_bytes()).await?;
-            w.write_all(
-                b"
-",
-            )
-            .await?;
+            w.write_all(b"\n").await?;
             w.flush().await?;
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(v)) => v,
-            Ok(Err(_)) => bail!("[{}] response channel dropped", self.name),
+            Ok(Err(_)) => bail!(
+                "[{}] response channel dropped — backend may have crashed",
+                self.name
+            ),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                bail!("[{}] {method} timed out", self.name)
+                bail!(
+                    "[{}] {method} timed out after {}s",
+                    self.name,
+                    self.timeout.as_secs()
+                )
             }
         }
     }
@@ -236,18 +428,24 @@ impl Backend {
         let mut g = self.stdin.lock().await;
         if let Some(w) = g.as_mut() {
             w.write_all(msg.as_bytes()).await?;
-            w.write_all(
-                b"
-",
-            )
-            .await?;
+            w.write_all(b"\n").await?;
             w.flush().await?;
         }
         Ok(())
     }
 
     /// Forward a tool call to this backend using the original tool name.
-    pub async fn call_tool(&self, original_name: &str, args: Value) -> Result<Value> {
+    /// If the backend has crashed and auto_restart is enabled, attempt restart first.
+    pub async fn call_tool(&mut self, original_name: &str, args: Value) -> Result<Value> {
+        // Auto-restart on crash if configured
+        if self.has_crashed() && self.cfg_snapshot.auto_restart {
+            info!(
+                "[{}] backend crashed, attempting auto-restart before tool call",
+                self.name
+            );
+            self.try_restart().await?;
+        }
+
         self.rpc(
             "tools/call",
             serde_json::json!({

@@ -32,7 +32,7 @@ pub fn init_config(path: &Path) -> Result<Option<PathBuf>> {
 // Install method
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum InstallConfig {
     Npm {
@@ -49,7 +49,7 @@ pub enum InstallConfig {
     Npx,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtractMethod {
     Tar,
@@ -58,7 +58,7 @@ pub enum ExtractMethod {
 }
 
 /// Where to run a backend that has an `install` config.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Runtime {
     /// Run inside an auto-built Docker container (default).
@@ -72,7 +72,7 @@ pub enum Runtime {
 // Server configuration
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     /// How to install the server (optional).
@@ -96,6 +96,34 @@ pub struct ServerConfig {
     /// How this backend is shared across client sessions.
     #[serde(default, skip_serializing_if = "Sharing::is_default")]
     pub shared: Sharing,
+    /// Per-tool RPC timeout in seconds (default: 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Idle timeout in seconds before the backend is reaped (default: 900 = 15 min).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+    /// Auto-restart the backend if it crashes (default: true).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub auto_restart: bool,
+    /// Maximum restart attempts before giving up (default: 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_restarts: Option<u32>,
+    /// Tool filter: glob patterns to include. If set, only matching tools are exposed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_tools: Vec<String>,
+    /// Tool filter: glob patterns to exclude (applied after include).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_tools: Vec<String>,
+    /// Tool aliases: map from alias name → original tool name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tool_aliases: HashMap<String, String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 /// Controls how a backend process is shared across client sessions.
@@ -126,7 +154,7 @@ fn is_default_runtime(r: &Runtime) -> bool {
 // Custom tool configuration
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum CustomToolConfig {
     Shell {
@@ -183,7 +211,7 @@ impl CustomToolConfig {
 /// Merge rules when overriding a base server:
 ///   - `command`, `args`, `install`, `envToggle` → replaced if present, inherited if omitted
 ///   - `env` → shallow-merged (override keys win, base keys preserved)
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerOverride {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,7 +235,7 @@ pub struct ServerOverride {
 /// Profiles are client-side: they tell the bridge which servers to request
 /// from the hub and what env overrides to send. The server never sees profile
 /// names — it just receives `X-MCP-Servers` and `X-MCP-Env` headers.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileConfig {
     /// Human-readable description.
@@ -225,7 +253,7 @@ pub struct ProfileConfig {
 // Root config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     #[serde(default)]

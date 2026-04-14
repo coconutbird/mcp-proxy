@@ -65,6 +65,12 @@ pub enum Cmd {
     },
     /// Create a starter servers.json config
     Init,
+    /// Validate config, start each backend, verify MCP handshake, then shut down
+    Test {
+        /// Only test specific servers (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        servers: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------

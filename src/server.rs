@@ -20,8 +20,8 @@ use crate::backend::{Backend, Tool};
 use crate::config::{Config, ServerConfig, Sharing, is_toggled_off};
 use crate::custom_tools::CustomTools;
 
-/// How long a non-default backend instance can sit idle before being reaped.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Default idle timeout if not configured per-server (15 min).
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// A single backend instance, keyed by (server_name, relevant_env_hash).
 struct BackendEntry {
@@ -96,18 +96,21 @@ fn backend_env_key(srv: &ServerConfig, env_overrides: &HashMap<String, String>) 
 /// (server_name, relevant_env_hash). Two clients that share the same
 /// credentials for a given server will reuse the same backend process.
 pub struct Hub {
-    raw_config: Config,
+    raw_config: RwLock<Config>,
     /// Individual backend instances keyed by (name, env_hash).
     backends: Arc<RwLock<HashMap<BackendKey, BackendEntry>>>,
-    custom: Arc<CustomTools>,
+    custom: RwLock<Arc<CustomTools>>,
 }
 
 impl Hub {
-    /// Boot the hub: spawns all default backend instances and starts
-    /// a background reaper that kills idle instances every minute.
+    /// Boot the hub: spawns all default backend instances concurrently
+    /// and starts a background reaper that kills idle instances.
     pub async fn new(raw_config: Config) -> Result<Self> {
         let empty_env = HashMap::new();
-        let mut backends = HashMap::new();
+
+        // Collect servers to start eagerly
+        let mut to_start: Vec<(String, ServerConfig, String)> = Vec::new();
+        let mut to_prebuild: Vec<(String, ServerConfig)> = Vec::new();
 
         info!("starting backends");
         for (name, srv) in &raw_config.servers {
@@ -119,12 +122,11 @@ impl Hub {
                 continue;
             }
             match srv.shared {
-                // Per-session: never start eagerly — spawned on connect.
                 Sharing::Session => {
                     debug!(server = name, "deferring (per-session)");
+                    to_prebuild.push((name.clone(), srv.clone()));
                     continue;
                 }
-                // Per-credential: only start if env vars are available now.
                 Sharing::Credentials => {
                     let required = relevant_env_keys(srv);
                     let missing: Vec<&str> = required
@@ -134,33 +136,53 @@ impl Hub {
                         .collect();
                     if !missing.is_empty() {
                         debug!(server = name, needs = missing.join(", "), "deferring");
+                        to_prebuild.push((name.clone(), srv.clone()));
                         continue;
                     }
                 }
-                // Global: always start eagerly.
                 Sharing::Global => {}
             }
             let env_key = backend_env_key(srv, &empty_env);
-            info!(server = name, "starting");
-            match Backend::start(name.clone(), srv, &empty_env).await {
-                Ok(be) => {
+            to_start.push((name.clone(), srv.clone(), env_key));
+        }
+
+        // Start all eager backends concurrently
+        let mut handles = Vec::new();
+        for (name, srv, env_key) in to_start {
+            let empty = empty_env.clone();
+            handles.push(tokio::spawn(async move {
+                info!(server = %name, "starting");
+                match Backend::start(name.clone(), &srv, &empty).await {
+                    Ok(be) => Ok((name, env_key, be)),
+                    Err(e) => {
+                        error!(server = %name, error = %e, "failed to start");
+                        Err((name, e))
+                    }
+                }
+            }));
+        }
+
+        let mut backends = HashMap::new();
+        for handle in handles {
+            match handle.await {
+                Ok(Ok((name, env_key, be))) => {
                     backends.insert(
-                        (name.clone(), env_key),
+                        (name, env_key),
                         BackendEntry {
                             backend: be,
                             last_used: None,
                         },
                     );
                 }
-                Err(e) => error!(server = name, error = %e, "failed to start"),
+                Ok(Err((name, e))) => {
+                    error!(server = %name, "startup failed: {e}");
+                }
+                Err(e) => error!("spawn task panicked: {e}"),
             }
         }
 
         // Pre-build Docker images for deferred servers so first connect is fast.
-        for (name, srv) in &raw_config.servers {
-            if name.starts_with('_') || backends.contains_key(&(name.clone(), String::new())) {
-                continue;
-            }
+        for (name, srv) in &to_prebuild {
             if srv.install.is_some() && matches!(srv.runtime, crate::config::Runtime::Docker) {
                 info!(server = name, "pre-building docker image");
                 if let Err(e) = crate::docker::ensure_image(name, srv).await {
@@ -170,9 +192,10 @@ impl Hub {
         }
 
         let custom = Arc::new(CustomTools::new(&raw_config.custom_tools));
+        let raw_config_for_reaper = raw_config.clone();
         let backends = Arc::new(RwLock::new(backends));
 
-        // Background reaper: every 60s, kill instances idle > 15 min
+        // Background reaper: every 60s, kill instances idle > their configured timeout
         let reaper = backends.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -183,7 +206,13 @@ impl Hub {
                     .iter()
                     .filter_map(|(key, entry)| {
                         let last = entry.last_used?;
-                        if last.elapsed() > IDLE_TIMEOUT {
+                        let idle_timeout = raw_config_for_reaper
+                            .servers
+                            .get(&key.0)
+                            .and_then(|s| s.idle_timeout_secs)
+                            .map(Duration::from_secs)
+                            .unwrap_or(DEFAULT_IDLE_TIMEOUT);
+                        if last.elapsed() > idle_timeout {
                             Some(key.clone())
                         } else {
                             None
@@ -200,9 +229,9 @@ impl Hub {
         });
 
         Ok(Self {
-            raw_config,
+            raw_config: RwLock::new(raw_config),
             backends,
-            custom,
+            custom: RwLock::new(custom),
         })
     }
 
@@ -218,15 +247,18 @@ impl Hub {
         env_overrides: &HashMap<String, String>,
         session_id: &str,
     ) -> Result<BackendKey> {
-        let srv = self
-            .raw_config
-            .servers
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown server: {name}"))?;
+        // Read config once, clone what we need, then release
+        let srv = {
+            let cfg = self.raw_config.read().await;
+            cfg.servers
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown server: {name}"))?
+        };
 
         let env_key = match srv.shared {
             Sharing::Global => "__default__".to_string(),
-            Sharing::Credentials => backend_env_key(srv, env_overrides),
+            Sharing::Credentials => backend_env_key(&srv, env_overrides),
             Sharing::Session => format!("session:{session_id}"),
         };
         let key: BackendKey = (name.to_string(), env_key.clone());
@@ -243,7 +275,7 @@ impl Hub {
         }
 
         // Fail fast: check all required env vars are resolvable.
-        let required = relevant_env_keys(srv);
+        let required = relevant_env_keys(&srv);
         let missing: Vec<&str> = required
             .iter()
             .filter(|k| !env_overrides.contains_key(k.as_str()) && std::env::var(k).is_err())
@@ -258,7 +290,7 @@ impl Hub {
 
         // Spawn new instance
         info!("spawning backend {name} ({env_key})");
-        let backend = Backend::start(name.to_string(), srv, env_overrides).await?;
+        let backend = Backend::start(name.to_string(), &srv, env_overrides).await?;
 
         // Global backends are never reaped; others have an idle timer.
         let last_used = match srv.shared {
@@ -280,17 +312,18 @@ impl Hub {
         env_overrides: &HashMap<String, String>,
         session_id: &str,
     ) -> Vec<(String, String)> {
+        let cfg = self.raw_config.read().await;
         let names: Vec<String> = if servers.is_empty() {
-            self.raw_config
-                .servers
+            cfg.servers
                 .keys()
                 .filter(|n| !n.starts_with('_'))
-                .filter(|n| !is_toggled_off(self.raw_config.servers[*n].env_toggle.as_deref()))
+                .filter(|n| !is_toggled_off(cfg.servers[*n].env_toggle.as_deref()))
                 .cloned()
                 .collect()
         } else {
             servers.to_vec()
         };
+        drop(cfg);
         let mut errors = Vec::new();
         for name in &names {
             if let Err(e) = self.ensure_backend(name, env_overrides, session_id).await {
@@ -302,13 +335,14 @@ impl Hub {
     }
 
     /// Compute the expected backend key for a server given the client context.
-    fn expected_key(
-        &self,
+    /// Takes a config ref to avoid re-acquiring the lock.
+    fn expected_key_with(
+        cfg: &Config,
         srv_name: &str,
         env_overrides: &HashMap<String, String>,
         session_id: &str,
     ) -> Option<String> {
-        let srv = self.raw_config.servers.get(srv_name)?;
+        let srv = cfg.servers.get(srv_name)?;
         Some(match srv.shared {
             Sharing::Global => "__default__".to_string(),
             Sharing::Credentials => backend_env_key(srv, env_overrides),
@@ -329,6 +363,7 @@ impl Hub {
             .ensure_backends(servers, env_overrides, session_id)
             .await;
 
+        let cfg = self.raw_config.read().await;
         let mut map = self.backends.write().await;
         let mut out: Vec<Tool> = Vec::new();
 
@@ -337,7 +372,8 @@ impl Hub {
             if !servers.is_empty() && !servers.contains(srv_name) {
                 continue;
             }
-            let expected = match self.expected_key(srv_name, env_overrides, session_id) {
+            let expected = match Self::expected_key_with(&cfg, srv_name, env_overrides, session_id)
+            {
                 Some(k) => k,
                 None => continue,
             };
@@ -349,7 +385,7 @@ impl Hub {
             }
             out.extend(be.tools.iter().cloned());
         }
-        out.extend(self.custom.list());
+        out.extend(self.custom.read().await.list());
         (out, errors)
     }
 
@@ -362,16 +398,18 @@ impl Hub {
         session_id: &str,
         tx: mpsc::Sender<BackendProgress>,
     ) -> (Vec<Tool>, Vec<(String, String)>) {
-        let names: Vec<String> = if servers.is_empty() {
-            self.raw_config
-                .servers
-                .keys()
-                .filter(|n| !n.starts_with('_'))
-                .filter(|n| !is_toggled_off(self.raw_config.servers[*n].env_toggle.as_deref()))
-                .cloned()
-                .collect()
-        } else {
-            servers.to_vec()
+        let names: Vec<String> = {
+            let cfg = self.raw_config.read().await;
+            if servers.is_empty() {
+                cfg.servers
+                    .keys()
+                    .filter(|n| !n.starts_with('_'))
+                    .filter(|n| !is_toggled_off(cfg.servers[*n].env_toggle.as_deref()))
+                    .cloned()
+                    .collect()
+            } else {
+                servers.to_vec()
+            }
         };
 
         // Spawn all backends concurrently
@@ -421,6 +459,7 @@ impl Hub {
         }
 
         // Collect tools (same as list_tools_for)
+        let cfg = self.raw_config.read().await;
         let mut map = self.backends.write().await;
         let mut out: Vec<Tool> = Vec::new();
         for ((srv_name, env_key), entry) in map.iter_mut() {
@@ -428,7 +467,8 @@ impl Hub {
             if !servers.is_empty() && !servers.contains(srv_name) {
                 continue;
             }
-            let expected = match self.expected_key(srv_name, env_overrides, session_id) {
+            let expected = match Self::expected_key_with(&cfg, srv_name, env_overrides, session_id)
+            {
                 Some(k) => k,
                 None => continue,
             };
@@ -440,7 +480,7 @@ impl Hub {
             }
             out.extend(be.tools.iter().cloned());
         }
-        out.extend(self.custom.list());
+        out.extend(self.custom.read().await.list());
         (out, errors)
     }
 
@@ -454,31 +494,34 @@ impl Hub {
         session_id: &str,
     ) -> Result<Value> {
         // Check custom tools first
-        if self.custom.has(name) {
-            return self.custom.call(name, &args).await;
+        {
+            let custom = self.custom.read().await;
+            if custom.has(name) {
+                return custom.call(name, &args).await;
+            }
         }
 
         // Find backend by prefix, checking include list.
-        // We use a write lock so we can touch `last_used` on hit.
+        let cfg = self.raw_config.read().await;
         let mut map = self.backends.write().await;
         for ((srv_name, env_key), entry) in map.iter_mut() {
-            let be = &entry.backend;
             if !servers.is_empty() && !servers.contains(srv_name) {
                 continue;
             }
-            let expected = match self.expected_key(srv_name, env_overrides, session_id) {
+            let expected = match Self::expected_key_with(&cfg, srv_name, env_overrides, session_id)
+            {
                 Some(k) => k,
                 None => continue,
             };
             if *env_key != expected {
                 continue;
             }
-            let prefix = format!("{}_", be.name);
+            let prefix = format!("{}_", entry.backend.name);
             if let Some(original) = name.strip_prefix(&prefix) {
                 if entry.last_used.is_some() {
                     entry.last_used = Some(Instant::now());
                 }
-                return be.call_tool(original, args).await;
+                return entry.backend.call_tool(original, args).await;
             }
         }
 
@@ -519,7 +562,9 @@ impl Hub {
                     "name": name,
                     "scope": scope,
                     "ready": entry.backend.ready,
+                    "crashed": entry.backend.has_crashed(),
                     "tools": entry.backend.tools.len(),
+                    "restarts": entry.backend.restart_count,
                     "idle_secs": entry.last_used.map(|t| t.elapsed().as_secs()),
                 })
             })
@@ -555,6 +600,208 @@ impl Hub {
             entry.backend.kill();
         }
     }
+
+    /// Hot-reload: diff old vs new config, then stop removed servers,
+    /// restart changed servers, and start new ones.
+    ///
+    /// Only touches **default** (eager, Global-shared) backends.
+    /// Session- and credential-scoped instances are left alone.
+    pub async fn reload(&self, new_config: Config) {
+        // Fast path: full structural equality — skip everything if identical.
+        {
+            let old_cfg = self.raw_config.read().await;
+            if *old_cfg == new_config {
+                debug!("config file re-read, no changes");
+                return;
+            }
+        }
+
+        let empty_env = HashMap::new();
+
+        // Diff old vs new under the config read lock
+        let (to_remove, to_restart, to_add, custom_changed) = {
+            let old_cfg = self.raw_config.read().await;
+            let old_servers = &old_cfg.servers;
+            let new_servers = &new_config.servers;
+
+            let mut remove = Vec::new();
+            let mut restart = Vec::new();
+            let mut add = Vec::new();
+
+            for (name, old_srv) in old_servers {
+                if name.starts_with('_') {
+                    continue;
+                }
+                match new_servers.get(name) {
+                    None => remove.push(name.clone()),
+                    Some(new_srv) if *old_srv != *new_srv => {
+                        // Log what specifically changed for this server
+                        let mut changes = Vec::new();
+                        if old_srv.command != new_srv.command {
+                            changes.push("command");
+                        }
+                        if old_srv.args != new_srv.args {
+                            changes.push("args");
+                        }
+                        if old_srv.env != new_srv.env {
+                            changes.push("env");
+                        }
+                        if old_srv.shared != new_srv.shared {
+                            changes.push("shared");
+                        }
+                        if old_srv.install != new_srv.install {
+                            changes.push("install");
+                        }
+                        if old_srv.runtime != new_srv.runtime {
+                            changes.push("runtime");
+                        }
+                        if old_srv.timeout_secs != new_srv.timeout_secs {
+                            changes.push("timeout");
+                        }
+                        if old_srv.idle_timeout_secs != new_srv.idle_timeout_secs {
+                            changes.push("idle_timeout");
+                        }
+                        if old_srv.include_tools != new_srv.include_tools {
+                            changes.push("include_tools");
+                        }
+                        if old_srv.exclude_tools != new_srv.exclude_tools {
+                            changes.push("exclude_tools");
+                        }
+                        if old_srv.tool_aliases != new_srv.tool_aliases {
+                            changes.push("tool_aliases");
+                        }
+                        if old_srv.env_toggle != new_srv.env_toggle {
+                            changes.push("env_toggle");
+                        }
+                        if old_srv.auto_restart != new_srv.auto_restart {
+                            changes.push("auto_restart");
+                        }
+                        if old_srv.max_restarts != new_srv.max_restarts {
+                            changes.push("max_restarts");
+                        }
+                        info!(
+                            server = %name,
+                            fields = %changes.join(", "),
+                            "server config changed"
+                        );
+                        restart.push(name.clone());
+                    }
+                    _ => {} // unchanged
+                }
+            }
+
+            for name in new_servers.keys() {
+                if !name.starts_with('_') && !old_servers.contains_key(name) {
+                    add.push(name.clone());
+                }
+            }
+
+            let custom_changed = old_cfg.custom_tools != new_config.custom_tools;
+            (remove, restart, add, custom_changed)
+        };
+
+        if to_remove.is_empty() && to_restart.is_empty() && to_add.is_empty() && !custom_changed {
+            // Config struct differs but no actionable server/tool changes
+            // (e.g. whitespace-only changes that parsed differently aren't possible
+            // with PartialEq, but this is a safety net)
+            info!("config reloaded — no actionable changes");
+            *self.raw_config.write().await = new_config;
+            return;
+        }
+
+        info!(
+            removed = to_remove.len(),
+            restarted = to_restart.len(),
+            added = to_add.len(),
+            custom_tools_changed = custom_changed,
+            "applying config reload"
+        );
+
+        let new_servers = &new_config.servers;
+        let mut map = self.backends.write().await;
+
+        // 1. Remove deleted servers (kill all scopes)
+        for name in &to_remove {
+            let keys: Vec<BackendKey> = map.keys().filter(|(n, _)| n == name).cloned().collect();
+            for key in keys {
+                if let Some(mut entry) = map.remove(&key) {
+                    entry.backend.kill();
+                }
+            }
+            info!(server = %name, "removed");
+        }
+
+        // 2. Restart changed servers (kill default instance, re-spawn)
+        for name in &to_restart {
+            let default_key = (name.clone(), "__default__".to_string());
+            if let Some(mut entry) = map.remove(&default_key) {
+                entry.backend.kill();
+            }
+            let Some(srv) = new_servers.get(name) else {
+                continue;
+            };
+            if is_toggled_off(srv.env_toggle.as_deref()) {
+                info!(server = %name, "toggled off after reload");
+                continue;
+            }
+            if !matches!(srv.shared, Sharing::Global) {
+                continue;
+            }
+            info!(server = %name, "restarting");
+            match Backend::start(name.clone(), srv, &empty_env).await {
+                Ok(be) => {
+                    let env_key = backend_env_key(srv, &empty_env);
+                    map.insert(
+                        (name.clone(), env_key),
+                        BackendEntry {
+                            backend: be,
+                            last_used: None,
+                        },
+                    );
+                }
+                Err(e) => error!(server = %name, "restart failed: {e}"),
+            }
+        }
+
+        // 3. Start newly added servers
+        for name in &to_add {
+            let Some(srv) = new_servers.get(name) else {
+                continue;
+            };
+            if is_toggled_off(srv.env_toggle.as_deref()) {
+                continue;
+            }
+            if !matches!(srv.shared, Sharing::Global) {
+                debug!(server = %name, "deferring new server (not Global)");
+                continue;
+            }
+            info!(server = %name, "starting (new in config)");
+            match Backend::start(name.clone(), srv, &empty_env).await {
+                Ok(be) => {
+                    let env_key = backend_env_key(srv, &empty_env);
+                    map.insert(
+                        (name.clone(), env_key),
+                        BackendEntry {
+                            backend: be,
+                            last_used: None,
+                        },
+                    );
+                }
+                Err(e) => error!(server = %name, "start failed: {e}"),
+            }
+        }
+
+        drop(map);
+
+        // 4. Update custom tools if changed
+        if custom_changed {
+            *self.custom.write().await = Arc::new(CustomTools::new(&new_config.custom_tools));
+            info!("custom tools reloaded");
+        }
+
+        *self.raw_config.write().await = new_config;
+        info!("config reload complete");
+    }
 }
 
 #[cfg(test)]
@@ -575,6 +822,13 @@ mod tests {
                 .collect(),
             env_toggle: None,
             shared: sharing,
+            timeout_secs: None,
+            idle_timeout_secs: None,
+            auto_restart: true,
+            max_restarts: None,
+            include_tools: Vec::new(),
+            exclude_tools: Vec::new(),
+            tool_aliases: HashMap::new(),
         }
     }
 

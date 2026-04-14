@@ -15,6 +15,14 @@ use tokio::process::Command;
 
 use crate::config::{ExtractMethod, InstallConfig, ServerConfig, expand_env_with_overrides};
 
+/// Simple random u32 using std::hash of the current instant + thread id.
+fn rand_u32() -> u32 {
+    let mut h = DefaultHasher::new();
+    std::time::Instant::now().hash(&mut h);
+    std::thread::current().id().hash(&mut h);
+    h.finish() as u32
+}
+
 /// Docker image tag for a backend: `mcp-proxy/<name>`
 fn image_tag(name: &str) -> String {
     format!("mcp-proxy/{name}")
@@ -178,6 +186,8 @@ pub async fn ensure_image(name: &str, cfg: &ServerConfig) -> Result<()> {
 ///
 /// Runs `docker run -i --rm` so stdio is piped and the container is removed
 /// on exit. Environment variables are passed via `-e` flags.
+/// Container names include a random suffix to avoid collisions when multiple
+/// instances of the same server run with different credentials.
 pub async fn run_container(
     name: &str,
     cfg: &ServerConfig,
@@ -186,8 +196,13 @@ pub async fn run_container(
     let tag = image_tag(name);
     let expand = |s: &str| expand_env_with_overrides(s, extra_env);
 
+    // Include a short random suffix to avoid naming collisions when
+    // multiple credential-scoped instances of the same server run.
+    let suffix: u32 = rand_u32();
+    let container_name = format!("mcp-proxy-{name}-{suffix:08x}");
+
     let mut cmd = Command::new("docker");
-    cmd.args(["run", "-i", "--rm", "--name", &format!("mcp-proxy-{name}")]);
+    cmd.args(["run", "-i", "--rm", "--name", &container_name]);
 
     // Pass environment variables
     let mut merged_env: HashMap<String, String> = cfg

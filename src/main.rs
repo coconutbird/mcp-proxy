@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
         cli::Cmd::Clients => cmd_clients(profile.as_deref()),
         cli::Cmd::Health { port } => cmd_health(port).await,
         cli::Cmd::Init => cmd_init(&args.config),
+        cli::Cmd::Test { servers } => cmd_test(&args.config, &servers).await,
     }
 }
 
@@ -82,10 +83,103 @@ async fn cmd_serve(
         std::process::exit(0);
     });
 
+    // Hot config reload: watch the config file for changes using OS events
+    let hub3 = hub.clone();
+    let cfg_path = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    spawn_config_watcher(hub3, cfg_path);
+
     match transport {
         "stdio" => transport::stdio::serve(hub).await,
         _ => transport::http::serve(hub, port).await,
     }
+}
+
+/// Watch the config file for changes using OS filesystem events (FSEvents on
+/// macOS, inotify on Linux, ReadDirectoryChanges on Windows). When a write is
+/// detected we debounce for 500ms (editors often do atomic save via tmp+rename)
+/// then reload the config and apply it to the running hub.
+fn spawn_config_watcher(hub: Arc<server::Hub>, config_path: std::path::PathBuf) {
+    use notify::{EventKind, RecursiveMode, Watcher};
+
+    // We watch the **parent directory** because many editors do atomic saves
+    // (write tmp → rename) which removes the inode. Watching the dir catches
+    // both in-place writes and renames.
+    let watch_dir = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let file_name = config_path.file_name().map(|n| n.to_os_string());
+
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // Use the recommended watcher for this OS (FSEvents on macOS, inotify on Linux)
+    let mut watcher = notify::recommended_watcher(tx).expect("failed to create filesystem watcher");
+    watcher
+        .watch(&watch_dir, RecursiveMode::NonRecursive)
+        .expect("failed to watch config directory");
+
+    // Spawn a dedicated thread for the blocking recv + a tokio task for the async reload.
+    // The thread owns the `watcher` (dropping it would stop watching).
+    std::thread::Builder::new()
+        .name("config-watcher".into())
+        .spawn(move || {
+            let _watcher = watcher; // prevent drop
+            let rt = tokio::runtime::Handle::current();
+            let mut debounce: Option<std::time::Instant> = None;
+
+            loop {
+                // Block until an event or timeout
+                let event = if debounce.is_some() {
+                    // In debounce window — poll with timeout
+                    match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                        Ok(ev) => Some(ev),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    // Idle — block indefinitely
+                    match rx.recv() {
+                        Ok(ev) => Some(ev),
+                        Err(_) => break,
+                    }
+                };
+
+                // If we got an event, check if it's relevant
+                if let Some(Ok(ev)) = event {
+                    let dominated = matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_));
+                    let relevant_file = file_name.as_ref().is_none_or(|target| {
+                        ev.paths
+                            .iter()
+                            .any(|p| p.file_name().is_some_and(|n| n == target))
+                    });
+                    if dominated && relevant_file {
+                        debounce = Some(std::time::Instant::now());
+                        continue; // restart debounce window
+                    }
+                }
+
+                // Debounce expired — time to reload
+                if let Some(t) = debounce.take() {
+                    if t.elapsed() >= std::time::Duration::from_millis(400) {
+                        let hub = hub.clone();
+                        let path = config_path.clone();
+                        rt.spawn(async move {
+                            tracing::info!("config file changed, reloading...");
+                            match config::load(&path) {
+                                Ok(new_cfg) => hub.reload(new_cfg).await,
+                                Err(e) => tracing::warn!("config reload failed: {e}"),
+                            }
+                        });
+                    } else {
+                        // Not enough time elapsed, re-enter debounce
+                        debounce = Some(t);
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn config watcher thread");
 }
 
 fn cmd_clients(profile: Option<&str>) -> Result<()> {
@@ -260,6 +354,13 @@ fn cmd_server(config_path: &std::path::Path, action: cli::ServerCmd) -> Result<(
                     env: env.into_iter().collect(),
                     env_toggle: None,
                     shared: Default::default(),
+                    timeout_secs: None,
+                    idle_timeout_secs: None,
+                    auto_restart: true,
+                    max_restarts: None,
+                    include_tools: Vec::new(),
+                    exclude_tools: Vec::new(),
+                    tool_aliases: HashMap::new(),
                 },
             );
 
@@ -457,4 +558,50 @@ fn cmd_profile(config_path: &std::path::Path, action: cli::ProfileCmd) -> Result
             Ok(())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test command
+// ---------------------------------------------------------------------------
+
+async fn cmd_test(config_path: &std::path::Path, filter_servers: &[String]) -> Result<()> {
+    eprintln!("🔍 validating config: {}", config_path.display());
+    let cfg = config::load(config_path)?;
+    eprintln!("  ✅ config parsed ({} server(s))\n", cfg.servers.len());
+
+    let empty_env = HashMap::new();
+    let mut pass = 0u32;
+    let mut fail = 0u32;
+
+    for (name, srv) in &cfg.servers {
+        if name.starts_with('_') {
+            continue;
+        }
+        if !filter_servers.is_empty() && !filter_servers.contains(name) {
+            continue;
+        }
+        eprint!("  testing {name}...");
+
+        match backend::Backend::start(name.clone(), srv, &empty_env).await {
+            Ok(mut be) => {
+                let tool_count = be.tools.len();
+                eprintln!(" ✅ {} tool(s)", tool_count);
+                for t in &be.tools {
+                    eprintln!("    • {}", t.name);
+                }
+                be.kill();
+                pass += 1;
+            }
+            Err(e) => {
+                eprintln!(" ❌ {e}");
+                fail += 1;
+            }
+        }
+    }
+
+    eprintln!("\n{pass} passed, {fail} failed");
+    if fail > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
