@@ -385,29 +385,42 @@ pub fn write_active_profile(profile: Option<&str>) -> Result<()> {
     save_user_config(&cfg)
 }
 
-/// Expand `${VAR}` references, checking `overrides` first, then process env.
-pub fn expand_env_with_overrides(s: &str, overrides: &HashMap<String, String>) -> String {
+/// Expand `${VAR}` references using `lookup` to resolve each variable name.
+/// The lookup returns `Option<String>`; unresolved vars become empty strings.
+/// Falls back to the process environment when `lookup` returns `None`.
+pub fn expand_vars(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = s.to_string();
     while let Some(start) = out.find("${") {
         let Some(end) = out[start..].find('}') else {
             break;
         };
         let key = &out[start + 2..start + end];
-        let val = overrides
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| std::env::var(key).unwrap_or_default());
+        let val = lookup(key)
+            .or_else(|| std::env::var(key).ok())
+            .unwrap_or_default();
         out = format!("{}{}{}", &out[..start], val, &out[start + end + 1..]);
     }
     out
 }
 
+/// Expand `${VAR}` references, checking `overrides` first, then process env.
+pub fn expand_env_with_overrides(s: &str, overrides: &HashMap<String, String>) -> String {
+    expand_vars(s, |key| overrides.get(key).cloned())
+}
+
 /// Check whether an env-toggle variable says "disabled".
 pub fn is_toggled_off(toggle: Option<&str>) -> bool {
+    is_toggled_off_with(toggle, |name| std::env::var(name).ok())
+}
+
+/// Testable version of [`is_toggled_off`] that takes a custom resolver
+/// instead of reading from the process environment directly.
+pub fn is_toggled_off_with(
+    toggle: Option<&str>,
+    resolver: impl Fn(&str) -> Option<String>,
+) -> bool {
     toggle.is_some_and(|name| {
-        std::env::var(name)
-            .ok()
-            .is_some_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0"))
+        resolver(name).is_some_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0"))
     })
 }
 
@@ -448,28 +461,27 @@ mod tests {
 
     #[test]
     fn is_toggled_off_none() {
-        assert!(!is_toggled_off(None));
+        assert!(!is_toggled_off_with(None, |_| None));
     }
 
     #[test]
     fn is_toggled_off_false() {
-        unsafe { std::env::set_var("__TEST_TOGGLE_F__", "false") };
-        assert!(is_toggled_off(Some("__TEST_TOGGLE_F__")));
-        unsafe { std::env::remove_var("__TEST_TOGGLE_F__") };
+        assert!(is_toggled_off_with(Some("X"), |_| Some("false".into())));
     }
 
     #[test]
     fn is_toggled_off_zero() {
-        unsafe { std::env::set_var("__TEST_TOGGLE_Z__", "0") };
-        assert!(is_toggled_off(Some("__TEST_TOGGLE_Z__")));
-        unsafe { std::env::remove_var("__TEST_TOGGLE_Z__") };
+        assert!(is_toggled_off_with(Some("X"), |_| Some("0".into())));
     }
 
     #[test]
     fn is_toggled_off_true_means_on() {
-        unsafe { std::env::set_var("__TEST_TOGGLE_T__", "true") };
-        assert!(!is_toggled_off(Some("__TEST_TOGGLE_T__")));
-        unsafe { std::env::remove_var("__TEST_TOGGLE_T__") };
+        assert!(!is_toggled_off_with(Some("X"), |_| Some("true".into())));
+    }
+
+    #[test]
+    fn is_toggled_off_unset_means_on() {
+        assert!(!is_toggled_off_with(Some("X"), |_| None));
     }
 
     #[test]

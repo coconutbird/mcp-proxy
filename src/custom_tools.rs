@@ -11,7 +11,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::backend::Tool;
-use crate::config::{CustomToolConfig, is_toggled_off};
+use crate::config::{CustomToolConfig, expand_vars, is_toggled_off};
 
 /// Prefix applied to custom tool names (e.g. `custom_my_tool`).
 pub const CUSTOM_TOOL_PREFIX: &str = "custom_";
@@ -19,6 +19,8 @@ pub const CUSTOM_TOOL_PREFIX: &str = "custom_";
 /// Executor for lightweight custom tools (shell / http) defined in config.
 pub struct CustomTools {
     tools: HashMap<String, CustomToolConfig>,
+    /// Shared HTTP client for connection pooling across custom tool calls.
+    http_client: reqwest::Client,
 }
 
 impl CustomTools {
@@ -35,7 +37,10 @@ impl CustomTools {
             tools.insert(name.clone(), cfg.clone());
         }
         info!("loaded {} custom tool(s)", tools.len());
-        Self { tools }
+        Self {
+            tools,
+            http_client: reqwest::Client::new(),
+        }
     }
 
     /// Return MCP tool definitions for all loaded custom tools.
@@ -80,6 +85,7 @@ impl CustomTools {
                 ..
             } => {
                 exec_http(
+                    &self.http_client,
                     url,
                     method.as_deref(),
                     headers.as_ref(),
@@ -93,27 +99,35 @@ impl CustomTools {
 }
 
 fn substitute(template: &str, args: &serde_json::Map<String, Value>) -> String {
-    let mut out = template.to_string();
-    while let Some(start) = out.find("${") {
-        let Some(end) = out[start..].find('}') else {
-            break;
-        };
-        let key = &out[start + 2..start + end];
-        let val = args
-            .get(key)
+    expand_vars(template, |key| {
+        args.get(key).map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+    })
+}
+
+/// Shell-escape a string value to prevent injection.
+/// Wraps the value in single quotes and escapes any embedded single quotes.
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Substitute `${VAR}` references in a shell command template, escaping
+/// argument values to prevent shell injection attacks.
+fn substitute_shell(template: &str, args: &serde_json::Map<String, Value>) -> String {
+    expand_vars(template, |key| {
+        args.get(key)
             .map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
+                Value::String(s) => shell_escape(s),
+                other => shell_escape(&other.to_string()),
             })
-            .or_else(|| std::env::var(key).ok())
-            .unwrap_or_default();
-        out = format!("{}{}{}", &out[..start], val, &out[start + end + 1..]);
-    }
-    out
+            .or_else(|| std::env::var(key).ok().map(|v| shell_escape(&v)))
+    })
 }
 
 async fn exec_shell(command: &str, args: &serde_json::Map<String, Value>) -> Result<Value> {
-    let cmd = substitute(command, args);
+    let cmd = substitute_shell(command, args);
     debug!(cmd = %cmd, "custom tool exec");
     let output = tokio::process::Command::new("sh")
         .arg("-c")
@@ -129,6 +143,7 @@ async fn exec_shell(command: &str, args: &serde_json::Map<String, Value>) -> Res
 }
 
 async fn exec_http(
+    client: &reqwest::Client,
     url_tpl: &str,
     method: Option<&str>,
     headers: Option<&HashMap<String, String>>,
@@ -139,7 +154,6 @@ async fn exec_http(
     let method = method.unwrap_or("GET");
     debug!(method = method, url = %url, "custom tool http");
 
-    let client = reqwest::Client::new();
     let mut req = client.request(method.parse()?, &url);
     if let Some(hdrs) = headers {
         for (k, v) in hdrs {

@@ -100,10 +100,7 @@ pub async fn run(
         debug!(servers = server_list.join(", "), "requesting servers");
     }
     if !env_overrides.is_empty() {
-        debug!(
-            vars = env_overrides.keys().cloned().collect::<Vec<_>>().join(", "),
-            "forwarding env"
-        );
+        debug!(count = env_overrides.len(), "forwarding env vars to hub");
     }
 
     let stdin = tokio::io::stdin();

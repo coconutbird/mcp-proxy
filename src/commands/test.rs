@@ -41,7 +41,7 @@ pub async fn run(config_path: &std::path::Path, filter_servers: &[String]) -> Re
 
     eprintln!("\n{pass} passed, {fail} failed");
     if fail > 0 {
-        std::process::exit(1);
+        anyhow::bail!("{fail} server(s) failed validation");
     }
     Ok(())
 }

@@ -74,7 +74,14 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> anyhow::Result<()> {
         .route("/health", get(handle_health))
         .with_state(state);
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    // Bind to loopback only by default — this is a local dev tool and
+    // exposing the unauthenticated proxy to the network is dangerous.
+    // Use MCP_BIND=0.0.0.0 or --bind 0.0.0.0 to listen on all interfaces.
+    let bind_addr: std::net::IpAddr = std::env::var("MCP_BIND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let addr = std::net::SocketAddr::from((bind_addr, port));
     info!(addr = %addr, "http transport listening");
     info!("  MCP endpoint: http://localhost:{port}/mcp");
     info!("  Health check: http://localhost:{port}/health");

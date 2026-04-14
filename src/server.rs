@@ -12,15 +12,13 @@
 //! for a single unified JSON-RPC dispatch path.
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::Value;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{Backend, Tool};
@@ -130,10 +128,14 @@ struct BackendEntry {
 /// Composite key: server name + hash of only the env vars that server cares about.
 type BackendKey = (String, String);
 
-fn sip_hash(s: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+/// FNV-1a 64-bit hash — deterministic across Rust versions (unlike DefaultHasher).
+fn stable_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// Extract the `${VAR}` references from a server config's env values and args.
@@ -184,7 +186,7 @@ fn backend_env_key(srv: &ServerConfig, env_overrides: &HashMap<String, String>) 
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("\0");
-    format!("{ENV_KEY_PREFIX}{:x}", sip_hash(&s))
+    format!("{ENV_KEY_PREFIX}{:x}", stable_hash(&s))
 }
 
 /// Compute the env-key portion of a backend key based on sharing mode.
@@ -208,6 +210,11 @@ pub struct Hub {
     /// Individual backend instances keyed by (name, env_hash).
     backends: Arc<RwLock<HashMap<BackendKey, BackendEntry>>>,
     custom: RwLock<Arc<CustomTools>>,
+    /// Per-key spawn lock to prevent duplicate backend spawns.
+    /// Guards the check-then-insert path in `ensure_backend` so that
+    /// two concurrent requests for the same un-spawned backend don't
+    /// both spawn a process (TOCTOU race).
+    spawn_locks: TokioMutex<HashMap<BackendKey, Arc<TokioMutex<()>>>>,
 }
 
 impl Hub {
@@ -344,6 +351,7 @@ impl Hub {
             raw_config,
             backends,
             custom: RwLock::new(custom),
+            spawn_locks: TokioMutex::new(HashMap::new()),
         })
     }
 
@@ -372,6 +380,30 @@ impl Hub {
         let key: BackendKey = (name.to_string(), env_key.clone());
 
         // Fast path: already running, touch idle timer
+        {
+            let mut map = self.backends.write().await;
+            if let Some(entry) = map.get_mut(&key) {
+                if entry.last_used.is_some() {
+                    entry.last_used = Some(Instant::now());
+                }
+                return Ok(key);
+            }
+        }
+
+        // Acquire per-key spawn lock to prevent duplicate spawns.
+        // Two concurrent requests for the same un-spawned backend will
+        // serialize here; the second one will find it in the map.
+        let spawn_lock = {
+            let mut locks = self.spawn_locks.lock().await;
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let _guard = spawn_lock.lock().await;
+
+        // Re-check after acquiring the spawn lock — another task may have
+        // already spawned this backend while we were waiting.
         {
             let mut map = self.backends.write().await;
             if let Some(entry) = map.get_mut(&key) {
@@ -766,11 +798,11 @@ impl Hub {
         }
     }
 
-    /// Kill all backend processes.
+    /// Kill all backend processes and wait for them to exit.
     pub async fn shutdown(&self) {
         let mut map = self.backends.write().await;
         for entry in map.values_mut() {
-            entry.backend.lock().await.kill();
+            entry.backend.lock().await.kill_and_wait().await;
         }
     }
 
@@ -1096,8 +1128,8 @@ mod tests {
     }
 
     #[test]
-    fn sip_hash_deterministic() {
-        assert_eq!(sip_hash("hello"), sip_hash("hello"));
-        assert_ne!(sip_hash("hello"), sip_hash("world"));
+    fn stable_hash_deterministic() {
+        assert_eq!(stable_hash("hello"), stable_hash("hello"));
+        assert_ne!(stable_hash("hello"), stable_hash("world"));
     }
 }

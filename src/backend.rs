@@ -239,8 +239,13 @@ impl Backend {
                     let _ = tx.send(val);
                 }
             }
-            // stdout closed → process exited
+            // stdout closed → process exited — fail all in-flight RPCs immediately
             crash_flag.store(true, Ordering::Relaxed);
+            let mut pending = p.lock().await;
+            for (_id, tx) in pending.drain() {
+                let _ = tx.send(Err(anyhow::anyhow!("[{tag}] backend process exited")));
+            }
+            drop(pending);
             notify.notify_waiters();
             warn!("[{tag}] process exited (stdout closed)");
         });
@@ -464,10 +469,27 @@ impl Backend {
         .await
     }
 
-    /// Kill the child process.
+    /// Kill the child process (fire-and-forget).
     pub fn kill(&mut self) {
         if let Some(ref mut c) = self.child {
             let _ = c.start_kill();
         }
+    }
+
+    /// Kill the child process and wait for it to fully exit.
+    pub async fn kill_and_wait(&mut self) {
+        if let Some(ref mut c) = self.child {
+            let _ = c.start_kill();
+            let _ = c.wait().await;
+        }
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        // Ensure the child process is killed when the Backend is dropped.
+        // This prevents orphaned processes if a Backend is dropped without
+        // an explicit kill() call.
+        self.kill();
     }
 }

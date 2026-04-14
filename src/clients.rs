@@ -87,12 +87,19 @@ pub fn mcp_entry(_client: &ClientDef, self_exe: &str, profile: Option<&str>) -> 
 
 pub fn install(client: &ClientDef, self_exe: &str, profile: Option<&str>) -> Result<bool> {
     let mut cfg = read_config(client).unwrap_or_else(|| serde_json::json!({ client.mcp_key: {} }));
-    let servers = cfg
+    let obj = cfg
         .as_object_mut()
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("client config for {} is not a JSON object", client.name))?;
+    let servers = obj
         .entry(client.mcp_key)
         .or_insert_with(|| serde_json::json!({}));
-    let map = servers.as_object_mut().unwrap();
+    let map = servers.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{}' in {} config is not a JSON object",
+            client.mcp_key,
+            client.name
+        )
+    })?;
     map.insert("mcp-proxy".into(), mcp_entry(client, self_exe, profile));
     write_config(client, &cfg)?;
     Ok(true)

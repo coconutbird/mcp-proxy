@@ -15,6 +15,7 @@ pub fn run(config_path: &std::path::Path, action: ServerCmd) -> Result<()> {
                 eprintln!("no servers configured");
                 return Ok(());
             }
+
             for (name, srv) in &cfg.servers {
                 let install_info = match &srv.install {
                     Some(config::InstallConfig::Npm { package }) => format!(" (npm: {package})"),
