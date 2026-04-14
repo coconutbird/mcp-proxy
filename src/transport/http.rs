@@ -2,7 +2,6 @@
 //!
 //! Exposes the hub as an HTTP server with:
 //! - `POST /mcp` — JSON-RPC requests (with optional SSE streaming for `tools/list`)
-//! - `GET  /mcp` — SSE endpoint placeholder for server-initiated messages
 //! - `DELETE /mcp` — session teardown
 //! - `GET  /health` — health check endpoint
 
@@ -15,7 +14,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use base64::Engine;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -42,8 +40,7 @@ fn decode_env_header(headers: &HeaderMap) -> HashMap<String, String> {
     headers
         .get(headers::ENV)
         .and_then(|v| v.to_str().ok())
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(&bytes).ok())
+        .map(super::decode_env_header)
         .unwrap_or_default()
 }
 
@@ -71,7 +68,6 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/mcp", post(handle_mcp))
-        .route("/mcp", get(handle_mcp_sse))
         .route("/mcp", delete(handle_mcp_delete))
         .route("/health", get(handle_health))
         .with_state(state);
@@ -207,7 +203,7 @@ async fn handle_mcp(
             .header("content-type", content_types::SSE)
             .header(headers::SESSION_ID, &session_id)
             .body(Body::from_stream(stream))
-            .unwrap();
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
     let result = state
@@ -224,14 +220,8 @@ async fn handle_mcp(
         .status(200)
         .header("content-type", content_types::JSON)
         .header(headers::SESSION_ID, &session_id)
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap()
-}
-
-/// GET /mcp — SSE endpoint for server-initiated messages (currently no-op).
-async fn handle_mcp_sse() -> Response {
-    // Placeholder: real SSE streaming for server notifications can be added later
-    (StatusCode::METHOD_NOT_ALLOWED, "use POST").into_response()
+        .body(Body::from(serde_json::to_string(&body).unwrap_or_default()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// DELETE /mcp — client session teardown. Kills all per-session backends.

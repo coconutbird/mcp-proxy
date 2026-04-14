@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use base64::Engine;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, error, info, warn};
 
@@ -77,14 +76,8 @@ fn collect_env_overrides(names: &[String]) -> HashMap<String, String> {
         .collect()
 }
 
-/// Encode env overrides as a base64 JSON header value.
-fn encode_env_header(env: &HashMap<String, String>) -> Option<String> {
-    if env.is_empty() {
-        return None;
-    }
-    let json = serde_json::to_string(env).ok()?;
-    Some(base64::engine::general_purpose::STANDARD.encode(json))
-}
+// encode_env_header is now in super (transport/mod.rs)
+use super::encode_env_header;
 
 /// Run the bridge, forwarding stdin → HTTP → stdout.
 ///

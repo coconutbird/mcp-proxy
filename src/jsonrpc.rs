@@ -55,12 +55,15 @@ impl<'a> Notification<'a> {
 pub struct Response {
     pub id: Option<u64>,
     pub result: Option<Value>,
-    pub error: Option<RpcError>,
+    pub error: Option<WireError>,
 }
 
-/// The `error` field inside a JSON-RPC response.
+/// The `error` object inside a JSON-RPC 2.0 wire response.
+///
+/// Named `WireError` (not `RpcError`) to avoid confusion with
+/// [`crate::server::RpcError`], which is the domain-level error enum.
 #[derive(Debug, Deserialize)]
-pub struct RpcError {
+pub struct WireError {
     #[allow(dead_code)]
     pub code: i64,
     pub message: String,

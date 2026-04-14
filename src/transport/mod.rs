@@ -25,3 +25,29 @@ pub mod content_types {
     pub const JSON: &str = "application/json";
     pub const SSE: &str = "text/event-stream";
 }
+
+// ---------------------------------------------------------------------------
+// Shared env-header codec (used by both HTTP server and bridge client)
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+use base64::Engine;
+
+/// Encode env overrides as a base64 JSON header value.
+pub fn encode_env_header(env: &HashMap<String, String>) -> Option<String> {
+    if env.is_empty() {
+        return None;
+    }
+    let json = serde_json::to_string(env).ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(json))
+}
+
+/// Decode a base64 JSON env-header value back to a map.
+pub fn decode_env_header(raw: &str) -> HashMap<String, String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(&bytes).ok())
+        .unwrap_or_default()
+}

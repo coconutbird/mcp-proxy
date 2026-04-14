@@ -212,8 +212,14 @@ impl Sharing {
     }
 }
 
+impl Runtime {
+    fn is_default(&self) -> bool {
+        matches!(self, Runtime::Docker)
+    }
+}
+
 fn is_default_runtime(r: &Runtime) -> bool {
-    matches!(r, Runtime::Docker)
+    r.is_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -458,54 +464,54 @@ pub fn write_active_profile(profile: Option<&str>) -> Result<()> {
     save_user_config(&cfg)
 }
 
+/// Iterate over `${VAR}` references in a string, yielding `(prefix, var_name)`.
+///
+/// Shared parser used by both [`expand_vars`] and [`extract_var_names`].
+fn var_references(s: &str) -> impl Iterator<Item = (&str, &str)> {
+    let mut rest = s;
+    std::iter::from_fn(move || {
+        let start = rest.find("${")?;
+        let prefix = &rest[..start];
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let name = &after[..end];
+                rest = &after[end + 1..];
+                Some((prefix, name))
+            }
+            None => {
+                // Unclosed `${` — stop iteration
+                rest = "";
+                None
+            }
+        }
+    })
+}
+
 /// Expand `${VAR}` references using `lookup` to resolve each variable name.
 /// The lookup returns `Option<String>`; unresolved vars become empty strings.
 /// Falls back to the process environment when `lookup` returns `None`.
 pub fn expand_vars(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end) => {
-                let key = &after[..end];
-                let val = lookup(key)
-                    .or_else(|| std::env::var(key).ok())
-                    .unwrap_or_default();
-                out.push_str(&val);
-                rest = &after[end + 1..];
-            }
-            None => {
-                // Unclosed `${` — emit literally and stop
-                out.push_str(&rest[start..]);
-                rest = "";
-                break;
-            }
-        }
+    let mut consumed = 0;
+    for (prefix, name) in var_references(s) {
+        out.push_str(prefix);
+        let val = lookup(name)
+            .or_else(|| std::env::var(name).ok())
+            .unwrap_or_default();
+        out.push_str(&val);
+        // Track how far we've consumed: prefix + "${" + name + "}"
+        consumed += prefix.len() + 2 + name.len() + 1;
     }
-    out.push_str(rest);
+    out.push_str(&s[consumed..]);
     out
 }
 
 /// Extract `${VAR}` variable names from a string without expanding them.
-///
-/// This is the shared parser for `${…}` references, reused by both
-/// [`expand_vars`] (for expansion) and server env-key detection.
 pub fn extract_var_names(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = s;
-    while let Some(start) = rest.find("${") {
-        let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end) => {
-                out.push(after[..end].to_string());
-                rest = &after[end + 1..];
-            }
-            None => break,
-        }
-    }
-    out
+    var_references(s)
+        .map(|(_, name)| name.to_string())
+        .collect()
 }
 
 /// Expand `${VAR}` references, checking `overrides` first, then process env.

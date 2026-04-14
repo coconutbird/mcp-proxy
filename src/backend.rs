@@ -168,9 +168,18 @@ impl Backend {
                 })?
         };
 
-        let child_stdin = child.stdin.take().unwrap();
-        let child_stdout = child.stdout.take().unwrap();
-        let child_stderr = child.stderr.take().unwrap();
+        let child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("[{name}] failed to capture stdin"))?;
+        let child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("[{name}] failed to capture stdout"))?;
+        let child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("[{name}] failed to capture stderr"))?;
 
         let pending: Arc<Mutex<Pending>> = Arc::default();
 
@@ -431,17 +440,33 @@ impl Backend {
     }
 
     /// Kill the child process (fire-and-forget).
+    ///
+    /// Closes stdin first so well-behaved backends can exit on their own,
+    /// then sends SIGKILL as a fallback.
     pub fn kill(&mut self) {
+        // Drop stdin so the backend sees EOF and can shut down gracefully.
+        self.stdin.take();
         if let Some(ref mut c) = self.child {
             let _ = c.start_kill();
         }
     }
 
     /// Kill the child process and wait for it to fully exit.
+    ///
+    /// Closes stdin first, gives the backend a brief window to exit
+    /// gracefully, then sends SIGKILL and waits for termination.
     pub async fn kill_and_wait(&mut self) {
+        // Close stdin so the backend sees EOF.
+        self.stdin.take();
         if let Some(ref mut c) = self.child {
-            let _ = c.start_kill();
-            let _ = c.wait().await;
+            // Give the backend a moment to exit on its own.
+            match tokio::time::timeout(Duration::from_millis(500), c.wait()).await {
+                Ok(_) => (),
+                Err(_) => {
+                    let _ = c.start_kill();
+                    let _ = c.wait().await;
+                }
+            }
         }
     }
 }

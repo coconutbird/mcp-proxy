@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -50,11 +51,30 @@ pub enum BackendProgress {
 // Internal types
 // ---------------------------------------------------------------------------
 
+/// Epoch for atomic timestamps — `last_used` stores elapsed millis from this base.
+static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// Convert an `Instant` to milliseconds since EPOCH (for atomic storage).
+fn instant_to_millis(t: Instant) -> u64 {
+    t.duration_since(*EPOCH).as_millis() as u64
+}
+
+/// Convert stored millis back to an `Instant`.
+fn millis_to_instant(ms: u64) -> Instant {
+    *EPOCH + Duration::from_millis(ms)
+}
+
+/// Sentinel value meaning "not reapable" (never reaped).
+const NOT_REAPABLE: u64 = 0;
+
 /// A single backend instance, keyed by (server_name, relevant_env_hash).
+///
+/// `last_used_ms` is an atomic counter so that [`BackendPool::matched_backends`]
+/// can bump it under a *read* lock instead of requiring a write lock on every
+/// request. `NOT_REAPABLE` (0) means the entry is never reaped.
 struct BackendEntry {
     backend: Arc<TokioMutex<Backend>>,
-    /// `None` = default instance (no env overrides, never reaped).
-    last_used: Option<Instant>,
+    last_used_ms: AtomicU64,
 }
 
 impl BackendEntry {
@@ -63,8 +83,34 @@ impl BackendEntry {
     fn new(backend: Backend, reapable: bool) -> Self {
         Self {
             backend: Arc::new(TokioMutex::new(backend)),
-            last_used: if reapable { Some(Instant::now()) } else { None },
+            last_used_ms: AtomicU64::new(if reapable {
+                instant_to_millis(Instant::now())
+            } else {
+                NOT_REAPABLE
+            }),
         }
+    }
+
+    /// Whether this entry is subject to idle reaping.
+    fn is_reapable(&self) -> bool {
+        self.last_used_ms.load(Ordering::Relaxed) != NOT_REAPABLE
+    }
+
+    /// Touch the entry (reset idle timer). No-op for non-reapable entries.
+    fn touch(&self) {
+        if self.is_reapable() {
+            self.last_used_ms
+                .store(instant_to_millis(Instant::now()), Ordering::Relaxed);
+        }
+    }
+
+    /// Seconds since last use. Returns `None` for non-reapable entries.
+    fn idle_secs(&self) -> Option<u64> {
+        let ms = self.last_used_ms.load(Ordering::Relaxed);
+        if ms == NOT_REAPABLE {
+            return None;
+        }
+        Some(millis_to_instant(ms).elapsed().as_secs())
     }
 }
 
@@ -246,14 +292,13 @@ impl BackendPool {
                     let map = reaper_backends.read().await;
                     map.iter()
                         .filter_map(|(key, entry)| {
-                            let last = entry.last_used?;
+                            let idle = entry.idle_secs()?;
                             let idle_timeout = cfg
                                 .servers
                                 .get(&key.server)
                                 .and_then(|s| s.idle_timeout_secs)
-                                .map(Duration::from_secs)
-                                .unwrap_or(DEFAULT_IDLE_TIMEOUT);
-                            if last.elapsed() > idle_timeout {
+                                .unwrap_or(DEFAULT_IDLE_TIMEOUT.as_secs());
+                            if idle > idle_timeout {
                                 Some(key.clone())
                             } else {
                                 None
@@ -354,18 +399,12 @@ impl BackendPool {
             scope: env_key.clone(),
         };
 
-        // Fast path: check under a read lock first (cheap, no contention)
+        // Fast path: read lock + atomic touch (no write lock contention).
         {
             let map = self.backends.read().await;
-            if map.contains_key(&key) {
-                drop(map);
-                let mut map = self.backends.write().await;
-                if let Some(entry) = map.get_mut(&key) {
-                    if entry.last_used.is_some() {
-                        entry.last_used = Some(Instant::now());
-                    }
-                    return Ok(key);
-                }
+            if let Some(entry) = map.get(&key) {
+                entry.touch();
+                return Ok(key);
             }
         }
 
@@ -379,13 +418,11 @@ impl BackendPool {
         };
         let _guard = spawn_lock.lock().await;
 
-        // Re-check after acquiring the spawn lock.
+        // Re-check after acquiring the spawn lock (another task may have spawned it).
         {
-            let mut map = self.backends.write().await;
-            if let Some(entry) = map.get_mut(&key) {
-                if entry.last_used.is_some() {
-                    entry.last_used = Some(Instant::now());
-                }
+            let map = self.backends.read().await;
+            if let Some(entry) = map.get(&key) {
+                entry.touch();
                 return Ok(key);
             }
         }
@@ -472,10 +509,10 @@ impl BackendPool {
         session_id: &str,
     ) -> Vec<(String, Arc<TokioMutex<Backend>>)> {
         let cfg = self.raw_config.read().await;
-        let mut map = self.backends.write().await;
+        let map = self.backends.read().await;
         let mut matched = Vec::new();
 
-        for (key, entry) in map.iter_mut() {
+        for (key, entry) in map.iter() {
             if !servers.is_empty() && !servers.contains(&key.server) {
                 continue;
             }
@@ -487,9 +524,7 @@ impl BackendPool {
             if key.scope != expected {
                 continue;
             }
-            if entry.last_used.is_some() {
-                entry.last_used = Some(Instant::now());
-            }
+            entry.touch();
             matched.push((key.server.clone(), entry.backend.clone()));
         }
         matched
@@ -591,18 +626,34 @@ impl BackendPool {
         env_overrides: &HashMap<String, String>,
         session_id: &str,
     ) -> Result<Value, RpcError> {
-        let matched = self
-            .matched_backends(servers, env_overrides, session_id)
-            .await;
+        // Direct lookup: extract the server name from the tool prefix and go
+        // straight to the backend map entry instead of scanning every backend.
+        let cfg = self.raw_config.read().await;
+        let map = self.backends.read().await;
+
         let (be_arc, original_name) = {
             let mut found = None;
-            for (srv_name, be) in &matched {
+            for (srv_name, srv_cfg) in &cfg.servers {
+                if !servers.is_empty() && !servers.contains(srv_name) {
+                    continue;
+                }
                 let prefix = format!("{srv_name}_");
                 if let Some(original) = name.strip_prefix(&prefix) {
-                    found = Some((be.clone(), original.to_string()));
+                    let scope = sharing_env_key(srv_cfg, env_overrides, session_id);
+                    let key = BackendKey {
+                        server: srv_name.clone(),
+                        scope,
+                    };
+                    if let Some(entry) = map.get(&key) {
+                        entry.touch();
+                        found = Some((entry.backend.clone(), original.to_string()));
+                    }
                     break;
                 }
             }
+            // Drop locks before awaiting the backend mutex.
+            drop(map);
+            drop(cfg);
             match found {
                 Some(f) => f,
                 None => return Err(RpcError::ToolNotFound(name.to_string())),
@@ -640,7 +691,7 @@ impl BackendPool {
                 "crashed": be.has_crashed(),
                 "tools": be.tools.len(),
                 "restarts": be.restart_count,
-                "idle_secs": entry.last_used.map(|t| t.elapsed().as_secs()),
+                "idle_secs": entry.idle_secs(),
             }));
         }
 

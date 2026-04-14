@@ -162,8 +162,14 @@ pub async fn ensure_image(name: &str, cfg: &ServerConfig) -> Result<()> {
     let label_arg = format!("LABEL {HASH_LABEL}=\"{hash}\"");
     let dockerfile_with_label = format!("{dockerfile}\n{label_arg}\n");
 
+    // Use an empty temp dir as the build context so we don't accidentally
+    // send the (potentially large) CWD to the Docker daemon.
+    let empty_ctx = std::env::temp_dir().join("mcp-proxy-empty-ctx");
+    std::fs::create_dir_all(&empty_ctx).ok();
+
     let mut child = Command::new("docker")
-        .args(["build", "-t", &tag, "-f", "-", "."])
+        .args(["build", "-t", &tag, "-f", "-"])
+        .arg(&empty_ctx)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
