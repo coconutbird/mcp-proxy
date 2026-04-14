@@ -21,7 +21,9 @@ use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::server::{BackendProgress, Hub, jsonrpc_err, jsonrpc_ok};
+use crate::jsonrpc;
+use crate::server::{BackendProgress, Hub};
+use crate::transport::{content_types, headers};
 
 /// Active session IDs. We only need to track existence for DELETE cleanup;
 /// per-request headers (`X-MCP-Servers`, `X-MCP-Env`) are decoded fresh
@@ -38,7 +40,7 @@ struct AppState {
 /// Decode the X-MCP-Env header: base64-encoded JSON map of env vars.
 fn decode_env_header(headers: &HeaderMap) -> HashMap<String, String> {
     headers
-        .get("x-mcp-env")
+        .get(headers::ENV)
         .and_then(|v| v.to_str().ok())
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(&bytes).ok())
@@ -48,7 +50,7 @@ fn decode_env_header(headers: &HeaderMap) -> HashMap<String, String> {
 /// Decode X-MCP-Servers header: comma-separated list of server names.
 fn decode_servers_header(headers: &HeaderMap) -> Vec<String> {
     headers
-        .get("x-mcp-servers")
+        .get(headers::SERVERS)
         .and_then(|v| v.to_str().ok())
         .map(|s| {
             s.split(',')
@@ -105,7 +107,7 @@ async fn handle_mcp(
     // Resolve or create session — reject unknown session IDs to prevent
     // hijacking of per-session backends.
     let session_id = match headers
-        .get("mcp-session-id")
+        .get(headers::SESSION_ID)
         .and_then(|v| v.to_str().ok())
         .map(String::from)
     {
@@ -183,7 +185,7 @@ async fn handle_mcp(
             let (tools, errors) = match handle.await {
                 Ok(r) => r,
                 Err(e) => {
-                    let err_resp = jsonrpc_err(&rid, -32000, &format!("internal error: {e}"));
+                    let err_resp = jsonrpc::err(&rid, jsonrpc::codes::INTERNAL, &format!("internal error: {e}"));
                     yield Ok(format!("data: {}\n\n", serde_json::to_string(&err_resp).unwrap()));
                     return;
                 }
@@ -196,14 +198,14 @@ async fn handle_mcp(
                     .collect();
                 result["_errors"] = Value::Array(err_list);
             }
-            let body = jsonrpc_ok(&rid, result);
+            let body = jsonrpc::ok(&rid, result);
             yield Ok(format!("data: {}\n\n", serde_json::to_string(&body).unwrap()));
         };
 
         return Response::builder()
             .status(200)
-            .header("content-type", "text/event-stream")
-            .header("mcp-session-id", &session_id)
+            .header("content-type", content_types::SSE)
+            .header(headers::SESSION_ID, &session_id)
             .body(Body::from_stream(stream))
             .unwrap();
     }
@@ -214,14 +216,14 @@ async fn handle_mcp(
         .await;
 
     let body = match result {
-        Ok(val) => jsonrpc_ok(&req_id, val),
+        Ok(val) => jsonrpc::ok(&req_id, val),
         Err(e) => e.to_json(&req_id),
     };
 
     Response::builder()
         .status(200)
-        .header("content-type", "application/json")
-        .header("mcp-session-id", &session_id)
+        .header("content-type", content_types::JSON)
+        .header(headers::SESSION_ID, &session_id)
         .body(Body::from(serde_json::to_string(&body).unwrap()))
         .unwrap()
 }
@@ -235,7 +237,7 @@ async fn handle_mcp_sse() -> Response {
 /// DELETE /mcp — client session teardown. Kills all per-session backends.
 async fn handle_mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let session_id = match headers
-        .get("mcp-session-id")
+        .get(headers::SESSION_ID)
         .and_then(|v| v.to_str().ok())
         .map(String::from)
     {

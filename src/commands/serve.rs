@@ -61,10 +61,20 @@ fn spawn_config_watcher(hub: Arc<Hub>, config_path: std::path::PathBuf) {
 
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let mut watcher = notify::recommended_watcher(tx).expect("failed to create filesystem watcher");
-    watcher
-        .watch(&watch_dir, RecursiveMode::NonRecursive)
-        .expect("failed to watch config directory");
+    let mut watcher = match notify::recommended_watcher(tx) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("failed to create filesystem watcher: {e} — hot-reload disabled");
+            return;
+        }
+    };
+    if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
+        tracing::warn!(
+            dir = %watch_dir.display(),
+            "failed to watch config directory: {e} — hot-reload disabled"
+        );
+        return;
+    }
 
     // Capture the runtime handle while we're still on the tokio runtime —
     // the spawned OS thread won't have a reactor context.

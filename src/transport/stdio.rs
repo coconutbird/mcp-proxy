@@ -12,7 +12,8 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{error, info};
 
-use crate::server::{Hub, STDIO_SESSION_ID, jsonrpc_ok};
+use crate::jsonrpc;
+use crate::server::{Hub, STDIO_SESSION_ID};
 use crate::util::write_line;
 
 /// Run the aggregator over stdin/stdout (JSON-RPC, one message per line).
@@ -60,7 +61,7 @@ pub async fn serve(hub: Arc<Hub>) -> Result<()> {
         // Only send a response if the request had an id (not a notification)
         if let Some(id) = id {
             let resp = match response {
-                Ok(result) => jsonrpc_ok(&id, result),
+                Ok(result) => jsonrpc::ok(&id, result),
                 Err(e) => e.to_json(&id),
             };
             let out = serde_json::to_string(&resp)?;

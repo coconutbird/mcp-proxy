@@ -64,7 +64,8 @@ pub fn read_config(client: &ClientDef) -> Option<Value> {
 }
 
 fn write_config(client: &ClientDef, cfg: &Value) -> Result<()> {
-    let out = serde_json::to_string_pretty(cfg)?;
+    let mut out = serde_json::to_string_pretty(cfg)?;
+    out.push('\n'); // consistent trailing newline (matches config::save_json)
     std::fs::write(&client.config_path, out)?;
     Ok(())
 }

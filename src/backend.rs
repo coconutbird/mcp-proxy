@@ -20,29 +20,10 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::config::{ServerConfig, expand_env_with_overrides, resolve_env};
+use crate::jsonrpc;
 
 /// Default RPC timeout if not configured per-server.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-
-#[derive(serde::Serialize)]
-struct Rpc<'a> {
-    jsonrpc: &'static str,
-    id: u64,
-    method: &'a str,
-    params: Value,
-}
-#[derive(serde::Deserialize)]
-struct Resp {
-    id: Option<u64>,
-    result: Option<Value>,
-    error: Option<RpcErr>,
-}
-#[derive(serde::Deserialize)]
-struct RpcErr {
-    #[allow(dead_code)]
-    code: i64,
-    message: String,
-}
 
 /// A tool discovered from a backend, namespaced as <backend>_<tool>.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -211,7 +192,7 @@ impl Backend {
         tokio::spawn(async move {
             let mut lines = BufReader::new(child_stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(resp) = serde_json::from_str::<Resp>(&line) else {
+                let Ok(resp) = serde_json::from_str::<jsonrpc::Response>(&line) else {
                     warn!("[{tag}] non-json stdout: {line}");
                     continue;
                 };
@@ -385,18 +366,24 @@ impl Backend {
         }
 
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
-        let msg = serde_json::to_string(&Rpc {
-            jsonrpc: "2.0",
-            id,
-            method,
-            params,
-        })?;
+        let msg = serde_json::to_string(&jsonrpc::Request::new(id, method, params))?;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        let w = self.stdin.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("[{}] stdin closed — backend may have crashed", self.name)
-        })?;
-        crate::util::write_line(w, msg.as_bytes()).await?;
+
+        // Write to stdin — if this fails, clean up the pending entry so the
+        // receiver doesn't hang until timeout or backend exit.
+        let write_result = match self.stdin.as_mut() {
+            Some(w) => crate::util::write_line(w, msg.as_bytes()).await,
+            None => Err(anyhow::anyhow!(
+                "[{}] stdin closed — backend may have crashed",
+                self.name
+            )),
+        };
+        if let Err(e) = write_result {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
+
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(_)) => bail!(
@@ -415,9 +402,7 @@ impl Backend {
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
-        let msg = serde_json::to_string(&serde_json::json!({
-            "jsonrpc": "2.0", "method": method, "params": params,
-        }))?;
+        let msg = serde_json::to_string(&jsonrpc::Notification::new(method, params))?;
         if let Some(w) = self.stdin.as_mut() {
             crate::util::write_line(w, msg.as_bytes()).await?;
         }

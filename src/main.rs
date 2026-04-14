@@ -10,6 +10,8 @@ mod commands;
 mod config;
 mod custom_tools;
 mod docker;
+mod jsonrpc;
+mod pool;
 mod server;
 mod transport;
 mod util;

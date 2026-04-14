@@ -11,7 +11,8 @@ use base64::Engine;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, error, info, warn};
 
-use crate::server::jsonrpc_err;
+use crate::jsonrpc;
+use crate::transport::{content_types, headers};
 use crate::util::write_line;
 
 // ---------------------------------------------------------------------------
@@ -186,19 +187,22 @@ pub async fn run(
 
         let mut req = client
             .post(url)
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream");
+            .header("content-type", content_types::JSON)
+            .header(
+                "accept",
+                format!("{}, {}", content_types::JSON, content_types::SSE),
+            );
 
         if let Some(ref sid) = session_id {
-            req = req.header("mcp-session-id", sid);
+            req = req.header(headers::SESSION_ID, sid);
         }
 
         if let Some(ref hdr) = env_header {
-            req = req.header("x-mcp-env", hdr);
+            req = req.header(headers::ENV, hdr);
         }
 
         if let Some(ref s) = servers_header {
-            req = req.header("x-mcp-servers", s);
+            req = req.header(headers::SERVERS, s);
         }
 
         // Parse request id for error responses (JSON-RPC 2.0 requires it).
@@ -213,14 +217,18 @@ pub async fn run(
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
                     error!(status = %status, body = body, "hub returned error");
-                    let err = jsonrpc_err(&req_id, -32000, &format!("hub returned HTTP {status}"));
+                    let err = jsonrpc::err(
+                        &req_id,
+                        jsonrpc::codes::INTERNAL,
+                        &format!("hub returned HTTP {status}"),
+                    );
                     let out = serde_json::to_string(&err)?;
                     write_line(&mut stdout, out.as_bytes()).await?;
                     continue;
                 }
 
                 // Capture session id on first response
-                if let Some(sid_hdr) = resp.headers().get("mcp-session-id") {
+                if let Some(sid_hdr) = resp.headers().get(headers::SESSION_ID) {
                     let new_sid = sid_hdr.to_str().ok().map(String::from);
                     if session_id.is_none() && new_sid.is_some() {
                         info!("connected");
@@ -230,7 +238,7 @@ pub async fn run(
 
                 let is_sse = resp
                     .headers()
-                    .get("content-type")
+                    .get("content-type") // standard HTTP header, not our custom one
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .contains("text/event-stream");
@@ -263,7 +271,11 @@ pub async fn run(
             }
             Err(e) => {
                 error!(error = %e, "request failed");
-                let err = jsonrpc_err(&req_id, -32000, &format!("bridge error: {e}"));
+                let err = jsonrpc::err(
+                    &req_id,
+                    jsonrpc::codes::INTERNAL,
+                    &format!("bridge error: {e}"),
+                );
                 let out = serde_json::to_string(&err)?;
                 write_line(&mut stdout, out.as_bytes()).await?;
             }
@@ -276,7 +288,7 @@ pub async fn run(
         info!(session = %sid, "cleaning up session");
         let _ = client
             .delete(url)
-            .header("mcp-session-id", sid)
+            .header(headers::SESSION_ID, sid)
             .send()
             .await;
     }
