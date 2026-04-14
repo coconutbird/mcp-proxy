@@ -172,5 +172,15 @@ pub async fn run(
         }
     }
 
+    // Client disconnected — tell the server to clean up our session.
+    if let Some(ref sid) = session_id {
+        eprintln!("bridge disconnecting, sending DELETE for session {sid}");
+        let _ = client
+            .delete(url)
+            .header("mcp-session-id", sid)
+            .send()
+            .await;
+    }
+
     Ok(())
 }

@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::backend::{Backend, Tool};
-use crate::config::{Config, ServerConfig, is_toggled_off};
+use crate::config::{Config, ServerConfig, Sharing, is_toggled_off};
 use crate::custom_tools::CustomTools;
 
 /// How long a non-default backend instance can sit idle before being reaped.
@@ -109,6 +109,28 @@ impl Hub {
                 eprintln!("  skipping {name} (toggled off)");
                 continue;
             }
+            match srv.shared {
+                // Per-session: never start eagerly — spawned on connect.
+                Sharing::Session => {
+                    eprintln!("  deferring {name} (per-session)");
+                    continue;
+                }
+                // Per-credential: only start if env vars are available now.
+                Sharing::Credentials => {
+                    let required = relevant_env_keys(srv);
+                    let missing: Vec<&str> = required
+                        .iter()
+                        .filter(|k| std::env::var(k).is_err())
+                        .map(|s| s.as_str())
+                        .collect();
+                    if !missing.is_empty() {
+                        eprintln!("  deferring {name} (needs: {})", missing.join(", "));
+                        continue;
+                    }
+                }
+                // Global: always start eagerly.
+                Sharing::Global => {}
+            }
             let env_key = backend_env_key(srv, &empty_env);
             eprintln!("  starting {name}");
             match Backend::start(name.clone(), srv, &empty_env).await {
@@ -162,21 +184,32 @@ impl Hub {
         })
     }
 
-    /// Get or spawn a backend for the given server name + client env.
+    /// Get or spawn a backend for the given server + client context.
+    ///
+    /// Key strategy by sharing mode:
+    ///   Global      → (name, "__default__")           — one process for all
+    ///   Credentials → (name, env:<hash of cred vars>) — shared when creds match
+    ///   Session     → (name, session:<id>)            — isolated per client
     async fn ensure_backend(
         &self,
         name: &str,
         env_overrides: &HashMap<String, String>,
+        session_id: &str,
     ) -> Result<BackendKey> {
         let srv = self
             .raw_config
             .servers
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown server: {name}"))?;
-        let env_key = backend_env_key(srv, env_overrides);
+
+        let env_key = match srv.shared {
+            Sharing::Global => "__default__".to_string(),
+            Sharing::Credentials => backend_env_key(srv, env_overrides),
+            Sharing::Session => format!("session:{session_id}"),
+        };
         let key: BackendKey = (name.to_string(), env_key.clone());
 
-        // Fast path: exists, touch it
+        // Fast path: already running, touch idle timer
         {
             let mut map = self.backends.write().await;
             if let Some(entry) = map.get_mut(&key) {
@@ -187,28 +220,42 @@ impl Hub {
             }
         }
 
-        // Slow path: spawn with client-specific env
-        info!("spawning backend {name} for env variant {env_key}");
+        // Fail fast: check all required env vars are resolvable.
+        let required = relevant_env_keys(srv);
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|k| !env_overrides.contains_key(k.as_str()) && std::env::var(k).is_err())
+            .map(|s| s.as_str())
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "server '{name}' requires env vars not provided: {}",
+                missing.join(", ")
+            );
+        }
+
+        // Spawn new instance
+        info!("spawning backend {name} ({env_key})");
         let backend = Backend::start(name.to_string(), srv, env_overrides).await?;
-        let is_default = env_key == "__default__";
+
+        // Global backends are never reaped; others have an idle timer.
+        let last_used = match srv.shared {
+            Sharing::Global => None,
+            _ => Some(Instant::now()),
+        };
 
         let mut map = self.backends.write().await;
-        map.insert(
-            key.clone(),
-            BackendEntry {
-                backend,
-                last_used: if is_default {
-                    None
-                } else {
-                    Some(Instant::now())
-                },
-            },
-        );
+        map.insert(key.clone(), BackendEntry { backend, last_used });
         Ok(key)
     }
 
     /// Ensure all requested backends exist (or all if `servers` is empty).
-    async fn ensure_backends(&self, servers: &[String], env_overrides: &HashMap<String, String>) {
+    async fn ensure_backends(
+        &self,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) {
         let names: Vec<String> = if servers.is_empty() {
             self.raw_config
                 .servers
@@ -221,10 +268,25 @@ impl Hub {
             servers.to_vec()
         };
         for name in &names {
-            if let Err(e) = self.ensure_backend(name, env_overrides).await {
+            if let Err(e) = self.ensure_backend(name, env_overrides, session_id).await {
                 eprintln!("failed to ensure backend {name}: {e}");
             }
         }
+    }
+
+    /// Compute the expected backend key for a server given the client context.
+    fn expected_key(
+        &self,
+        srv_name: &str,
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) -> Option<String> {
+        let srv = self.raw_config.servers.get(srv_name)?;
+        Some(match srv.shared {
+            Sharing::Global => "__default__".to_string(),
+            Sharing::Credentials => backend_env_key(srv, env_overrides),
+            Sharing::Session => format!("session:{session_id}"),
+        })
     }
 
     /// List tools, filtered by the client's server include list.
@@ -233,23 +295,24 @@ impl Hub {
         &self,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
+        session_id: &str,
     ) -> Vec<Tool> {
-        self.ensure_backends(servers, env_overrides).await;
+        self.ensure_backends(servers, env_overrides, session_id)
+            .await;
 
         let map = self.backends.read().await;
         let mut out: Vec<Tool> = Vec::new();
 
-        for ((_, env_key), entry) in map.iter() {
+        for ((srv_name, env_key), entry) in map.iter() {
             let be = &entry.backend;
-            if !servers.is_empty() && !servers.contains(&be.name) {
+            if !servers.is_empty() && !servers.contains(srv_name) {
                 continue;
             }
-            // Only include backends whose env key matches this client
-            let srv = match self.raw_config.servers.get(&be.name) {
-                Some(s) => s,
+            let expected = match self.expected_key(srv_name, env_overrides, session_id) {
+                Some(k) => k,
                 None => continue,
             };
-            if env_key != &backend_env_key(srv, env_overrides) {
+            if *env_key != expected {
                 continue;
             }
             out.extend(be.tools.iter().cloned());
@@ -265,6 +328,7 @@ impl Hub {
         args: Value,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
+        session_id: &str,
     ) -> Result<Value> {
         // Check custom tools first
         if self.custom.has(name) {
@@ -278,11 +342,11 @@ impl Hub {
             if !servers.is_empty() && !servers.contains(srv_name) {
                 continue;
             }
-            let srv = match self.raw_config.servers.get(srv_name) {
-                Some(s) => s,
+            let expected = match self.expected_key(srv_name, env_overrides, session_id) {
+                Some(k) => k,
                 None => continue,
             };
-            if env_key != &backend_env_key(srv, env_overrides) {
+            if *env_key != expected {
                 continue;
             }
             let prefix = format!("{}_", be.name);
@@ -294,14 +358,15 @@ impl Hub {
         anyhow::bail!("unknown tool: {name}");
     }
 
-    // -- Convenience wrappers: all servers, no env overrides --
+    // -- Convenience wrappers: all servers, no env overrides, stdio session --
 
     pub async fn list_tools(&self) -> Vec<Tool> {
-        self.list_tools_for(&[], &HashMap::new()).await
+        self.list_tools_for(&[], &HashMap::new(), "__stdio__").await
     }
 
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<Value> {
-        self.call_tool_for(name, args, &[], &HashMap::new()).await
+        self.call_tool_for(name, args, &[], &HashMap::new(), "__stdio__")
+            .await
     }
 
     /// Health summary for /health endpoint.
@@ -320,6 +385,23 @@ impl Hub {
             })
             .collect();
         serde_json::json!({ "backends": entries })
+    }
+
+    /// Kill all backends belonging to a specific session.
+    pub async fn cleanup_session(&self, session_id: &str) {
+        let session_key = format!("session:{session_id}");
+        let mut map = self.backends.write().await;
+        let stale: Vec<BackendKey> = map
+            .keys()
+            .filter(|(_, env_key)| *env_key == session_key)
+            .cloned()
+            .collect();
+        for key in &stale {
+            if let Some(mut entry) = map.remove(key) {
+                info!("cleaning up {} for session {session_id}", key.0);
+                entry.backend.kill();
+            }
+        }
     }
 
     /// Kill all backend processes.

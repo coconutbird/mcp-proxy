@@ -93,6 +93,29 @@ pub struct ServerConfig {
     /// Env var that can disable this server when set to `false` or `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_toggle: Option<String>,
+    /// How this backend is shared across client sessions.
+    #[serde(default, skip_serializing_if = "Sharing::is_default")]
+    pub shared: Sharing,
+}
+
+/// Controls how a backend process is shared across client sessions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Sharing {
+    /// One instance per client session — fully isolated (default).
+    #[default]
+    Session,
+    /// Shared across sessions with matching credentials for this server.
+    /// Two clients with the same GITHUB_TOKEN share one github process.
+    Credentials,
+    /// Single global instance shared by everyone. No credentials needed.
+    Global,
+}
+
+impl Sharing {
+    fn is_default(&self) -> bool {
+        matches!(self, Sharing::Session)
+    }
 }
 
 fn is_default_runtime(r: &Runtime) -> bool {

@@ -285,6 +285,7 @@ fn cmd_server(config_path: &std::path::Path, action: cli::ServerCmd) -> Result<(
                     args,
                     env: env.into_iter().collect(),
                     env_toggle: None,
+                    shared: Default::default(),
                 },
             );
 

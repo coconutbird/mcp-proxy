@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use serde_json::Value;
@@ -69,6 +69,7 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/mcp", post(handle_mcp))
         .route("/mcp", get(handle_mcp_sse))
+        .route("/mcp", delete(handle_mcp_delete))
         .route("/health", get(handle_health))
         .with_state(state);
 
@@ -126,7 +127,15 @@ async fn handle_mcp(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let id = req.get("id").cloned();
 
-    let result = handle_request(&state.hub, &method, params, &servers, &env_overrides).await;
+    let result = handle_request(
+        &state.hub,
+        &method,
+        params,
+        &servers,
+        &env_overrides,
+        &session_id,
+    )
+    .await;
 
     // Notifications (no id) get 202 Accepted
     let Some(req_id) = id else {
@@ -155,6 +164,32 @@ async fn handle_mcp_sse() -> Response {
     (StatusCode::METHOD_NOT_ALLOWED, "use POST").into_response()
 }
 
+/// DELETE /mcp — client session teardown. Kills all per-session backends.
+async fn handle_mcp_delete(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session_id = match headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+    {
+        Some(id) => id,
+        None => {
+            return (StatusCode::BAD_REQUEST, "missing mcp-session-id header").into_response();
+        }
+    };
+
+    // Remove session
+    let removed = state.sessions.write().await.remove(&session_id).is_some();
+    if !removed {
+        return (StatusCode::NOT_FOUND, "unknown session").into_response();
+    }
+
+    // Kill all per-session backends
+    info!("session {session_id} disconnected, cleaning up backends");
+    state.hub.cleanup_session(&session_id).await;
+
+    (StatusCode::OK, "session closed").into_response()
+}
+
 async fn handle_health(State(state): State<AppState>) -> Json<Value> {
     let mut health = state.hub.health().await;
     if let Some(obj) = health.as_object_mut() {
@@ -172,6 +207,7 @@ async fn handle_request(
     params: Value,
     servers: &[String],
     env_overrides: &HashMap<String, String>,
+    session_id: &str,
 ) -> anyhow::Result<Value> {
     match method {
         "initialize" => Ok(serde_json::json!({
@@ -181,7 +217,7 @@ async fn handle_request(
         })),
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
-            let tools = hub.list_tools_for(servers, env_overrides).await;
+            let tools = hub.list_tools_for(servers, env_overrides, session_id).await;
             Ok(serde_json::json!({ "tools": tools }))
         }
         "tools/call" => {
@@ -190,7 +226,8 @@ async fn handle_request(
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-            hub.call_tool_for(name, args, servers, env_overrides).await
+            hub.call_tool_for(name, args, servers, env_overrides, session_id)
+                .await
         }
         _ => anyhow::bail!("unsupported method: {method}"),
     }
