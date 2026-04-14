@@ -36,6 +36,7 @@ dialoguer = "0.11"
 base64 = "0.22.1"
 async-stream = "0.3.6"
 notify = { version = "7", features = ["macos_fsevent"] }
+thiserror = "2.0.18"
 
 [profile.release]
 opt-level = 3

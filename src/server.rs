@@ -12,7 +12,6 @@
 //! for a single unified JSON-RPC dispatch path.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,7 @@ use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{Backend, Tool};
-use crate::config::{Config, ServerConfig, Sharing, diff_fields};
+use crate::config::{Config, ServerConfig, Sharing, diff_fields, extract_var_names};
 use crate::custom_tools::CustomTools;
 
 // ---------------------------------------------------------------------------
@@ -66,15 +65,19 @@ pub fn jsonrpc_err(id: &Value, code: i64, message: &str) -> Value {
 ///
 /// Maps to standard JSON-RPC 2.0 error codes so HTTP and stdio transports
 /// can return proper error objects instead of generic -32000.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     /// -32601: Method not found.
+    #[error("unsupported method: {0}")]
     MethodNotFound(String),
     /// -32602: Invalid params (e.g. missing tool name).
+    #[error("{0}")]
     InvalidParams(String),
     /// -32002: Tool not found (server-defined error).
+    #[error("unknown tool: {0}")]
     ToolNotFound(String),
     /// -32000: Generic backend / internal error.
+    #[error("{0}")]
     Internal(String),
 }
 
@@ -92,19 +95,6 @@ impl RpcError {
         jsonrpc_err(id, self.code(), &self.to_string())
     }
 }
-
-impl fmt::Display for RpcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MethodNotFound(m) => write!(f, "unsupported method: {m}"),
-            Self::InvalidParams(m) => write!(f, "{m}"),
-            Self::ToolNotFound(m) => write!(f, "unknown tool: {m}"),
-            Self::Internal(m) => write!(f, "{m}"),
-        }
-    }
-}
-
-impl std::error::Error for RpcError {}
 
 impl From<anyhow::Error> for RpcError {
     fn from(e: anyhow::Error) -> Self {
@@ -159,28 +149,14 @@ use crate::util::fnv1a;
 pub fn relevant_env_keys(srv: &ServerConfig) -> Vec<String> {
     let mut keys = Vec::new();
     for val in srv.env.values() {
-        extract_var_refs(val, &mut keys);
+        keys.extend(extract_var_names(val));
     }
     for arg in &srv.args {
-        extract_var_refs(arg, &mut keys);
+        keys.extend(extract_var_names(arg));
     }
     keys.sort();
     keys.dedup();
     keys
-}
-
-/// Pull `${VAR}` names out of a string.
-fn extract_var_refs(s: &str, out: &mut Vec<String>) {
-    let mut rest = s;
-    while let Some(start) = rest.find("${") {
-        let after = &rest[start + 2..];
-        if let Some(end) = after.find('}') {
-            out.push(after[..end].to_string());
-            rest = &after[end + 1..];
-        } else {
-            break;
-        }
-    }
 }
 
 /// Build the env-hash portion of a backend key, using only the env vars
@@ -1023,24 +999,18 @@ mod tests {
     }
 
     #[test]
-    fn extract_var_refs_basic() {
-        let mut out = Vec::new();
-        extract_var_refs("--token=${TOKEN}", &mut out);
-        assert_eq!(out, vec!["TOKEN"]);
+    fn extract_var_names_basic() {
+        assert_eq!(extract_var_names("--token=${TOKEN}"), vec!["TOKEN"]);
     }
 
     #[test]
-    fn extract_var_refs_multiple() {
-        let mut out = Vec::new();
-        extract_var_refs("${A}_${B}_plain", &mut out);
-        assert_eq!(out, vec!["A", "B"]);
+    fn extract_var_names_multiple() {
+        assert_eq!(extract_var_names("${A}_${B}_plain"), vec!["A", "B"]);
     }
 
     #[test]
-    fn extract_var_refs_none() {
-        let mut out = Vec::new();
-        extract_var_refs("no vars here", &mut out);
-        assert!(out.is_empty());
+    fn extract_var_names_none() {
+        assert!(extract_var_names("no vars here").is_empty());
     }
 
     #[test]

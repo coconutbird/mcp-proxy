@@ -183,3 +183,59 @@ fn substitute_value(v: &Value, args: &serde_json::Map<String, Value>) -> Value {
         other => other.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn shell_escape_plain() {
+        assert_eq!(shell_escape("hello"), "'hello'");
+    }
+
+    #[test]
+    fn shell_escape_single_quote() {
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_escape_special_chars() {
+        assert_eq!(shell_escape("a; rm -rf /"), "'a; rm -rf /'");
+    }
+
+    #[test]
+    fn substitute_shell_replaces_vars() {
+        let mut args = serde_json::Map::new();
+        args.insert("name".into(), json!("world"));
+        let result = substitute_shell("echo ${name}", &args);
+        assert_eq!(result, "echo 'world'");
+    }
+
+    #[test]
+    fn substitute_shell_escapes_injection() {
+        let mut args = serde_json::Map::new();
+        args.insert("input".into(), json!("'; rm -rf / #"));
+        let result = substitute_shell("echo ${input}", &args);
+        // Input: '; rm -rf / #
+        // shell_escape wraps in single quotes and escapes embedded quotes:
+        //   '' + \' + '; rm -rf / #'
+        assert_eq!(result, "echo ''\\''; rm -rf / #'");
+    }
+
+    #[test]
+    fn substitute_plain_no_escaping() {
+        let mut args = serde_json::Map::new();
+        args.insert("url".into(), json!("https://example.com"));
+        let result = substitute("${url}/path", &args);
+        assert_eq!(result, "https://example.com/path");
+    }
+
+    #[test]
+    fn substitute_numeric_value() {
+        let mut args = serde_json::Map::new();
+        args.insert("count".into(), json!(42));
+        let result = substitute("items: ${count}", &args);
+        assert_eq!(result, "items: 42");
+    }
+}

@@ -13,6 +13,10 @@ pub struct ClientDef {
     pub name: &'static str,
     pub config_path: PathBuf,
     pub mcp_key: &'static str,
+    /// If true, the client is considered "available" when the parent directory
+    /// exists (e.g. Claude Desktop creates the file on first launch). If false,
+    /// the config file itself must exist.
+    pub check_parent_dir: bool,
 }
 
 pub fn known_clients() -> Vec<ClientDef> {
@@ -29,22 +33,25 @@ pub fn known_clients() -> Vec<ClientDef> {
                 _ => home.join(".config/Claude/claude_desktop_config.json"),
             },
             mcp_key: "mcpServers",
+            check_parent_dir: true,
         },
         ClientDef {
             name: "Claude CLI",
             config_path: home.join(".claude.json"),
             mcp_key: "mcpServers",
+            check_parent_dir: false,
         },
         ClientDef {
             name: "Augment",
             config_path: home.join(".augment/settings.json"),
             mcp_key: "mcpServers",
+            check_parent_dir: false,
         },
     ]
 }
 
 pub fn is_available(client: &ClientDef) -> bool {
-    if client.name == "Claude Desktop" {
+    if client.check_parent_dir {
         client.config_path.parent().is_some_and(|p| p.exists())
     } else {
         client.config_path.exists()

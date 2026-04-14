@@ -14,11 +14,15 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Relative config directory under the user's home.
+const CONFIG_DIR: &str = ".config/mcp-proxy";
+
 /// Default config path: ~/.config/mcp-proxy/servers.json
 pub fn default_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/mcp-proxy/servers.json")
+        .join(CONFIG_DIR)
+        .join("servers.json")
 }
 
 const STARTER_CONFIG: &str = include_str!("../config/starter.json");
@@ -216,21 +220,28 @@ fn is_default_runtime(r: &Runtime) -> bool {
 // Custom tool configuration
 // ---------------------------------------------------------------------------
 
+/// Fields shared by all custom tool variants.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomToolBase {
+    pub description: String,
+    #[serde(rename = "inputSchema")]
+    pub input_schema: Value,
+    #[serde(rename = "envToggle", skip_serializing_if = "Option::is_none")]
+    pub env_toggle: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum CustomToolConfig {
     Shell {
-        description: String,
-        #[serde(rename = "inputSchema")]
-        input_schema: Value,
+        #[serde(flatten)]
+        base: CustomToolBase,
         command: String,
-        #[serde(rename = "envToggle", skip_serializing_if = "Option::is_none")]
-        env_toggle: Option<String>,
     },
     Http {
-        description: String,
-        #[serde(rename = "inputSchema")]
-        input_schema: Value,
+        #[serde(flatten)]
+        base: CustomToolBase,
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         method: Option<String>,
@@ -238,28 +249,26 @@ pub enum CustomToolConfig {
         headers: Option<HashMap<String, String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         body: Option<Value>,
-        #[serde(rename = "envToggle", skip_serializing_if = "Option::is_none")]
-        env_toggle: Option<String>,
     },
 }
 
 impl CustomToolConfig {
-    pub fn description(&self) -> &str {
+    pub fn base(&self) -> &CustomToolBase {
         match self {
-            Self::Shell { description, .. } | Self::Http { description, .. } => description,
+            Self::Shell { base, .. } | Self::Http { base, .. } => base,
         }
+    }
+
+    pub fn description(&self) -> &str {
+        &self.base().description
     }
 
     pub fn input_schema(&self) -> &Value {
-        match self {
-            Self::Shell { input_schema, .. } | Self::Http { input_schema, .. } => input_schema,
-        }
+        &self.base().input_schema
     }
 
     pub fn env_toggle(&self) -> Option<&str> {
-        match self {
-            Self::Shell { env_toggle, .. } | Self::Http { env_toggle, .. } => env_toggle.as_deref(),
-        }
+        self.base().env_toggle.as_deref()
     }
 }
 
@@ -423,7 +432,8 @@ pub struct UserConfig {
 fn user_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/mcp-proxy/config.json")
+        .join(CONFIG_DIR)
+        .join("config.json")
 }
 
 pub fn load_user_config() -> UserConfig {
@@ -475,6 +485,26 @@ pub fn expand_vars(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
         }
     }
     out.push_str(rest);
+    out
+}
+
+/// Extract `${VAR}` variable names from a string without expanding them.
+///
+/// This is the shared parser for `${…}` references, reused by both
+/// [`expand_vars`] (for expansion) and server env-key detection.
+pub fn extract_var_names(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                out.push(after[..end].to_string());
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
     out
 }
 

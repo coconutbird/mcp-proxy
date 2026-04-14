@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::server::{BackendProgress, Hub, jsonrpc_ok};
+use crate::server::{BackendProgress, Hub, jsonrpc_err, jsonrpc_ok};
 
 /// Active session IDs. We only need to track existence for DELETE cleanup;
 /// per-request headers (`X-MCP-Servers`, `X-MCP-Env`) are decoded fresh
@@ -180,7 +180,14 @@ async fn handle_mcp(
             }
 
             // All backends done — build final result
-            let (tools, errors) = handle.await.unwrap();
+            let (tools, errors) = match handle.await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_resp = jsonrpc_err(&rid, -32000, &format!("internal error: {e}"));
+                    yield Ok(format!("data: {}\n\n", serde_json::to_string(&err_resp).unwrap()));
+                    return;
+                }
+            };
             let mut result = serde_json::json!({ "tools": tools });
             if !errors.is_empty() {
                 let err_list: Vec<Value> = errors

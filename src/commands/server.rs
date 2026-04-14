@@ -15,15 +15,11 @@ pub fn run(config_path: &std::path::Path, action: ServerCmd) -> Result<()> {
             }
 
             for (name, srv) in &cfg.servers {
-                let install_info = match &srv.install {
-                    Some(config::InstallConfig::Npm { package }) => format!(" (npm: {package})"),
-                    Some(config::InstallConfig::Pip { package }) => format!(" (pip: {package})"),
-                    Some(config::InstallConfig::Binary { binary, .. }) => {
-                        format!(" (binary: {binary})")
-                    }
-                    Some(config::InstallConfig::Npx) => " (npx)".to_string(),
-                    None => String::new(),
-                };
+                let install_info = srv
+                    .install
+                    .as_ref()
+                    .map(|i| format!(" ({i})"))
+                    .unwrap_or_default();
                 let rt = if srv.install.is_some() {
                     match srv.runtime {
                         config::Runtime::Docker => " [docker]",

@@ -13,6 +13,58 @@ use tracing::{debug, error, info, warn};
 
 use crate::server::jsonrpc_err;
 use crate::util::write_line;
+
+// ---------------------------------------------------------------------------
+// SSE line parser
+// ---------------------------------------------------------------------------
+
+/// Result of parsing a single SSE line.
+#[derive(Debug, PartialEq)]
+pub enum SseEvent {
+    /// A progress event (has `_progress` field) — should be logged, not forwarded.
+    Progress { server: String, status: String },
+    /// A regular JSON-RPC data payload — should be forwarded to the client.
+    Data(String),
+    /// Not a data line, or empty data — skip.
+    Skip,
+}
+
+/// Extract the `data:` payload from an SSE line, if present.
+fn strip_sse_data(line: &str) -> Option<&str> {
+    let line = line.trim();
+    line.strip_prefix("data: ")
+        .or_else(|| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Classify a single SSE data payload.
+fn classify_sse_data(data: &str) -> SseEvent {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+        && v.get("_progress").is_some()
+    {
+        let server = v
+            .get("server")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let status = v
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?")
+            .to_string();
+        return SseEvent::Progress { server, status };
+    }
+    SseEvent::Data(data.to_string())
+}
+
+/// Parse a single SSE line into an [`SseEvent`].
+pub fn parse_sse_line(line: &str) -> SseEvent {
+    match strip_sse_data(line) {
+        Some(data) => classify_sse_data(data),
+        None => SseEvent::Skip,
+    }
+}
 /// Collect env vars by name from the current process environment.
 fn collect_env_overrides(names: &[String]) -> HashMap<String, String> {
     names
@@ -184,58 +236,21 @@ pub async fn run(
                     .contains("text/event-stream");
 
                 if is_sse {
-                    // Simplified SSE parser: we only look for `data:` lines and
-                    // ignore `event:`, `id:`, and `retry:` fields. This is
-                    // sufficient because the MCP HTTP+SSE transport only emits
-                    // `data:` lines with JSON payloads (no multi-line data
-                    // fields or named event types). If the upstream spec ever
-                    // uses those features, this parser will need updating.
                     let mut buf = String::new();
                     while let Some(chunk) = resp.chunk().await? {
                         buf.push_str(&String::from_utf8_lossy(&chunk));
-                        // Process complete lines — drain processed bytes to avoid
-                        // quadratic reallocations.
                         while let Some(pos) = buf.find('\n') {
                             let line: String = buf.drain(..=pos).collect();
-                            let line = line.trim();
-                            // SSE spec: "data:" may or may not have a trailing space.
-                            let data = line
-                                .strip_prefix("data: ")
-                                .or_else(|| line.strip_prefix("data:"));
-                            if let Some(data) = data {
-                                let data = data.trim();
-                                if data.is_empty() {
-                                    continue;
+                            match parse_sse_line(&line) {
+                                SseEvent::Progress { server, status } => match status.as_str() {
+                                    "ready" => info!(server = %server, "backend ready"),
+                                    "failed" => warn!(server = %server, "backend failed"),
+                                    _ => {}
+                                },
+                                SseEvent::Data(data) => {
+                                    write_line(&mut stdout, data.as_bytes()).await?;
                                 }
-                                // Progress events → log to stderr, don't forward
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
-                                    && v.get("_progress").is_some()
-                                {
-                                    let server =
-                                        v.get("server").and_then(|s| s.as_str()).unwrap_or("?");
-                                    let status =
-                                        v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-                                    match status {
-                                        "ready" => {
-                                            let tools = v
-                                                .get("tools")
-                                                .and_then(|t| t.as_u64())
-                                                .unwrap_or(0);
-                                            info!(server = server, tools = tools, "backend ready");
-                                        }
-                                        "failed" => {
-                                            let err = v
-                                                .get("error")
-                                                .and_then(|s| s.as_str())
-                                                .unwrap_or("?");
-                                            warn!(server = server, "{err}");
-                                        }
-                                        _ => {}
-                                    }
-                                    continue;
-                                }
-                                // Regular JSON-RPC data → forward to client
-                                write_line(&mut stdout, data.as_bytes()).await?;
+                                SseEvent::Skip => {}
                             }
                         }
                     }
@@ -267,4 +282,61 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_data_line() {
+        let event = parse_sse_line("data: {\"jsonrpc\":\"2.0\",\"id\":1}");
+        assert_eq!(
+            event,
+            SseEvent::Data("{\"jsonrpc\":\"2.0\",\"id\":1}".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_data_no_space() {
+        let event = parse_sse_line("data:{\"id\":2}");
+        assert_eq!(event, SseEvent::Data("{\"id\":2}".to_string()));
+    }
+
+    #[test]
+    fn parse_progress_ready() {
+        let line = r#"data: {"_progress":true,"server":"foo","status":"ready","tools":3}"#;
+        assert_eq!(
+            parse_sse_line(line),
+            SseEvent::Progress {
+                server: "foo".into(),
+                status: "ready".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_progress_failed() {
+        let line = r#"data: {"_progress":true,"server":"bar","status":"failed","error":"boom"}"#;
+        assert_eq!(
+            parse_sse_line(line),
+            SseEvent::Progress {
+                server: "bar".into(),
+                status: "failed".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_empty_data() {
+        assert_eq!(parse_sse_line("data: "), SseEvent::Skip);
+        assert_eq!(parse_sse_line("data:"), SseEvent::Skip);
+    }
+
+    #[test]
+    fn parse_non_data_line() {
+        assert_eq!(parse_sse_line("event: message"), SseEvent::Skip);
+        assert_eq!(parse_sse_line(""), SseEvent::Skip);
+        assert_eq!(parse_sse_line(": comment"), SseEvent::Skip);
+    }
 }

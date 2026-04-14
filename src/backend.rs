@@ -103,7 +103,7 @@ pub struct Backend {
     exit_notify: Arc<Notify>,
     seq: AtomicU64,
     pending: Arc<Mutex<Pending>>,
-    stdin: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
+    stdin: Option<tokio::process::ChildStdin>,
     timeout: Duration,
     child: Option<Child>,
     /// Stored so we can restart with the same params.
@@ -138,7 +138,7 @@ impl Backend {
             exit_notify,
             seq: AtomicU64::new(1),
             pending,
-            stdin,
+            stdin: Some(stdin),
             timeout: Duration::from_secs(timeout_secs),
             child: Some(child),
             cfg_snapshot: cfg.clone(),
@@ -156,11 +156,7 @@ impl Backend {
         extra_env: &HashMap<String, String>,
         crashed: &Arc<AtomicBool>,
         exit_notify: &Arc<Notify>,
-    ) -> Result<(
-        Arc<Mutex<Pending>>,
-        Arc<Mutex<Option<tokio::process::ChildStdin>>>,
-        Child,
-    )> {
+    ) -> Result<(Arc<Mutex<Pending>>, tokio::process::ChildStdin, Child)> {
         let expand = |s: &str| expand_env_with_overrides(s, extra_env);
 
         let args: Vec<String> = cfg.args.iter().map(|a| expand(a)).collect();
@@ -196,7 +192,6 @@ impl Backend {
         let child_stderr = child.stderr.take().unwrap();
 
         let pending: Arc<Mutex<Pending>> = Arc::default();
-        let stdin = Arc::new(Mutex::new(Some(child_stdin)));
 
         // Drain stderr to the hub stderr
         let tag = name.to_string();
@@ -240,7 +235,7 @@ impl Backend {
             warn!("[{tag}] process exited (stdout closed)");
         });
 
-        Ok((pending, stdin, child))
+        Ok((pending, child_stdin, child))
     }
 
     /// Apply include/exclude tool filters and aliases from the config.
@@ -319,7 +314,7 @@ impl Backend {
         .await?;
 
         self.pending = pending;
-        self.stdin = stdin;
+        self.stdin = Some(stdin);
         self.child = Some(child);
 
         self.handshake().await?;
@@ -380,7 +375,7 @@ impl Backend {
         Ok(())
     }
 
-    async fn rpc(&self, method: &str, params: Value) -> Result<Value> {
+    async fn rpc(&mut self, method: &str, params: Value) -> Result<Value> {
         // Check if process has crashed before trying
         if self.crashed.load(Ordering::Relaxed) {
             bail!(
@@ -398,13 +393,10 @@ impl Backend {
         })?;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        {
-            let mut g = self.stdin.lock().await;
-            let w = g.as_mut().ok_or_else(|| {
-                anyhow::anyhow!("[{}] stdin closed — backend may have crashed", self.name)
-            })?;
-            crate::util::write_line(w, msg.as_bytes()).await?;
-        }
+        let w = self.stdin.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("[{}] stdin closed — backend may have crashed", self.name)
+        })?;
+        crate::util::write_line(w, msg.as_bytes()).await?;
         match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(_)) => bail!(
@@ -422,12 +414,11 @@ impl Backend {
         }
     }
 
-    async fn notify(&self, method: &str, params: Value) -> Result<()> {
+    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         let msg = serde_json::to_string(&serde_json::json!({
             "jsonrpc": "2.0", "method": method, "params": params,
         }))?;
-        let mut g = self.stdin.lock().await;
-        if let Some(w) = g.as_mut() {
+        if let Some(w) = self.stdin.as_mut() {
             crate::util::write_line(w, msg.as_bytes()).await?;
         }
         Ok(())
