@@ -1,12 +1,11 @@
 //! The Hub — central aggregation layer for MCP backends.
 //!
-//! The [`Hub`] manages a collection of [`Backend`] instances keyed by
-//! `(server_name, env_hash)`. It handles:
+//! This module is split into two layers:
 //!
-//! - **Backend lifecycle**: spawning, reaping idle instances, crash recovery
-//! - **Tool routing**: mapping prefixed tool names to the right backend
-//! - **Hot config reload**: diffing old vs new configs, restarting changed backends
-//! - **Credential scoping**: clients with different API keys get separate backends
+//! - [`BackendPool`] — owns backend processes and their lifecycle (spawning,
+//!   reaping idle instances, crash recovery, hot-reload).
+//! - [`Hub`] — thin routing layer that combines the pool with custom tools
+//!   and exposes a unified JSON-RPC dispatch surface.
 //!
 //! Two transports (stdio and HTTP) both delegate to [`Hub::handle_request`]
 //! for a single unified JSON-RPC dispatch path.
@@ -195,27 +194,26 @@ fn sharing_env_key(
     }
 }
 
-/// The aggregator: holds individual backend instances keyed by
-/// (server_name, relevant_env_hash). Two clients that share the same
-/// credentials for a given server will reuse the same backend process.
+// ---------------------------------------------------------------------------
+// BackendPool — backend lifecycle management
+// ---------------------------------------------------------------------------
+
+/// Per-key mutex to prevent duplicate backend spawns.
 type SpawnLocks = Arc<TokioMutex<HashMap<BackendKey, Arc<TokioMutex<()>>>>>;
 
-pub struct Hub {
+/// Owns backend processes and manages their lifecycle: spawning, idle reaping,
+/// crash recovery, and hot-reload. Does NOT know about custom tools — that
+/// concern lives in [`Hub`].
+pub struct BackendPool {
     raw_config: Arc<RwLock<Config>>,
-    /// Individual backend instances keyed by (name, env_hash).
     backends: Arc<RwLock<HashMap<BackendKey, BackendEntry>>>,
-    custom: RwLock<Arc<CustomTools>>,
-    /// Per-key spawn lock to prevent duplicate backend spawns.
-    /// Guards the check-then-insert path in `ensure_backend` so that
-    /// two concurrent requests for the same un-spawned backend don't
-    /// both spawn a process (TOCTOU race).
     spawn_locks: SpawnLocks,
 }
 
-impl Hub {
-    /// Boot the hub: spawns all default backend instances concurrently
+impl BackendPool {
+    /// Boot the pool: spawns all default backend instances concurrently
     /// and starts a background reaper that kills idle instances.
-    pub async fn new(raw_config: Config) -> Result<Self> {
+    async fn new(raw_config: &Config) -> Result<Self> {
         let empty_env = HashMap::new();
 
         // Collect servers to start eagerly
@@ -298,14 +296,11 @@ impl Hub {
             }
         }
 
-        let custom = Arc::new(CustomTools::new(&raw_config.custom_tools));
-        let raw_config = Arc::new(RwLock::new(raw_config));
+        let raw_config = Arc::new(RwLock::new(raw_config.clone()));
         let backends = Arc::new(RwLock::new(backends));
-
         let spawn_locks: SpawnLocks = Arc::new(TokioMutex::new(HashMap::new()));
 
         // Background reaper: every 60s, kill instances idle > their configured timeout.
-        // Uses the shared Arc<RwLock<Config>> so hot-reloaded timeouts take effect.
         let reaper_backends = backends.clone();
         let reaper_config = raw_config.clone();
         let reaper_locks = spawn_locks.clone();
@@ -339,7 +334,6 @@ impl Hub {
                         info!(server = %key.server, scope = %key.scope, "reaped idle backend");
                     }
                 }
-                // Purge spawn-lock entries for reaped keys to prevent unbounded growth.
                 if !stale.is_empty() {
                     let mut locks = reaper_locks.lock().await;
                     for key in &stale {
@@ -352,7 +346,6 @@ impl Hub {
         Ok(Self {
             raw_config,
             backends,
-            custom: RwLock::new(custom),
             spawn_locks,
         })
     }
@@ -474,11 +467,11 @@ impl Hub {
 
         let mut handles = Vec::new();
         for name in names {
-            let hub = Arc::clone(self);
+            let pool = Arc::clone(self);
             let env = env_overrides.clone();
             let sid = session_id.to_string();
             handles.push(tokio::spawn(async move {
-                if let Err(e) = hub.ensure_backend(&name, &env, &sid).await {
+                if let Err(e) = pool.ensure_backend(&name, &env, &sid).await {
                     warn!(server = %name, error = %e, "failed to ensure backend");
                     Some((name, e.to_string()))
                 } else {
@@ -541,7 +534,8 @@ impl Hub {
     }
 
     /// Collect tools from matching backends, touching idle timers.
-    async fn collect_tools(
+    /// Returns only backend tools — custom tools are added by [`Hub`].
+    async fn backend_tools(
         &self,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
@@ -555,29 +549,12 @@ impl Hub {
             let be = be_arc.lock().await;
             out.extend(be.tools.iter().cloned());
         }
-        out.extend(self.custom.read().await.list());
         out
     }
 
-    /// List tools, filtered by the client's server include list.
-    /// Empty `servers` = all servers.
-    /// Returns `(tools, errors)` — errors lists backends that failed to start.
-    pub async fn list_tools_for(
-        self: &Arc<Self>,
-        servers: &[String],
-        env_overrides: &HashMap<String, String>,
-        session_id: &str,
-    ) -> (Vec<Tool>, Vec<(String, String)>) {
-        let errors = self
-            .ensure_backends(servers, env_overrides, session_id)
-            .await;
-        let tools = self.collect_tools(servers, env_overrides, session_id).await;
-        (tools, errors)
-    }
-
-    /// Streaming version of `list_tools_for` — starts all backends concurrently
-    /// and sends progress events as each one finishes, then returns the final tool list.
-    pub async fn list_tools_streaming(
+    /// Ensure all backends then collect their tools with progress events.
+    /// Returns only backend tools — custom tools are added by [`Hub`].
+    async fn backend_tools_streaming(
         self: &Arc<Self>,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
@@ -596,15 +573,15 @@ impl Hub {
         // Spawn all backends concurrently
         let mut handles = Vec::new();
         for name in names {
-            let hub = Arc::clone(self);
+            let pool = Arc::clone(self);
             let env = env_overrides.clone();
             let sid = session_id.to_string();
             let progress_tx = tx.clone();
             handles.push(tokio::spawn(async move {
-                match hub.ensure_backend(&name, &env, &sid).await {
+                match pool.ensure_backend(&name, &env, &sid).await {
                     Ok(key) => {
                         let tool_count = {
-                            let map = hub.backends.read().await;
+                            let map = pool.backends.read().await;
                             match map.get(&key) {
                                 Some(e) => e.backend.lock().await.tools.len(),
                                 None => 0,
@@ -634,7 +611,6 @@ impl Hub {
         }
         drop(tx);
 
-        // Collect results
         let mut errors = Vec::new();
         for handle in handles {
             if let Ok(Err((name, msg))) = handle.await {
@@ -642,16 +618,13 @@ impl Hub {
             }
         }
 
-        let tools = self.collect_tools(servers, env_overrides, session_id).await;
+        let tools = self.backend_tools(servers, env_overrides, session_id).await;
         (tools, errors)
     }
 
-    /// Route a tool call, respecting the client's server include list.
-    ///
-    /// Uses `srv_name` from the backend key to match tool prefixes — this
-    /// avoids locking each individual backend during the search. Only the
-    /// target backend is locked, and only after the map lock is released.
-    pub async fn call_tool_for(
+    /// Route a tool call to the correct backend by matching the tool name
+    /// prefix against server names from the pre-filtered set.
+    async fn call_tool(
         &self,
         name: &str,
         args: Value,
@@ -659,16 +632,6 @@ impl Hub {
         env_overrides: &HashMap<String, String>,
         session_id: &str,
     ) -> Result<Value, RpcError> {
-        // Check custom tools first
-        {
-            let custom = self.custom.read().await;
-            if custom.has(name) {
-                return custom.call(name, &args).await.map_err(RpcError::from);
-            }
-        }
-
-        // Find the target backend by matching the tool name prefix against
-        // server names from the pre-filtered set.
         let matched = self
             .matched_backends(servers, env_overrides, session_id)
             .await;
@@ -687,71 +650,14 @@ impl Hub {
             }
         };
 
-        // Perform the RPC outside the map lock — only this backend is locked.
         let mut be = be_arc.lock().await;
         be.call_tool(&original_name, args)
             .await
             .map_err(RpcError::from)
     }
 
-    /// Unified JSON-RPC method dispatch for both stdio and HTTP transports.
-    ///
-    /// Returns `Result<Value, RpcError>` so transports can map errors to
-    /// the correct JSON-RPC error codes.
-    pub async fn handle_request(
-        self: &Arc<Self>,
-        method: &str,
-        params: Value,
-        servers: &[String],
-        env_overrides: &HashMap<String, String>,
-        session_id: &str,
-    ) -> Result<Value, RpcError> {
-        match method {
-            "initialize" => Ok(serde_json::json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
-                "serverInfo": {
-                    "name": "mcp-proxy",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-            })),
-            "notifications/initialized" => Ok(Value::Null),
-            "tools/list" => {
-                let (tools, errors) = self
-                    .list_tools_for(servers, env_overrides, session_id)
-                    .await;
-                let mut result = serde_json::json!({ "tools": tools });
-                if !errors.is_empty() {
-                    let err_list: Vec<Value> = errors
-                        .into_iter()
-                        .map(|(name, msg)| serde_json::json!({ "server": name, "error": msg }))
-                        .collect();
-                    result["_errors"] = Value::Array(err_list);
-                }
-                Ok(result)
-            }
-            "tools/call" => {
-                let name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| RpcError::InvalidParams("missing tool name".into()))?;
-                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                self.call_tool_for(name, args, servers, env_overrides, session_id)
-                    .await
-            }
-            "resources/list" | "resources/read" => Err(RpcError::MethodNotFound(
-                "resources are not supported by mcp-proxy".into(),
-            )),
-            "prompts/list" | "prompts/get" => Err(RpcError::MethodNotFound(
-                "prompts are not supported by mcp-proxy".into(),
-            )),
-            _ => Err(RpcError::MethodNotFound(method.to_string())),
-        }
-    }
-
-    /// Health summary for /health endpoint.
-    /// Does NOT expose session IDs or credential hashes.
-    pub async fn health(&self) -> Value {
+    /// Health summary of backend processes.
+    async fn health(&self) -> Value {
         let map = self.backends.read().await;
         let mut session_count = 0u64;
         let mut entries: Vec<Value> = Vec::new();
@@ -786,7 +692,7 @@ impl Hub {
     }
 
     /// Kill all backends belonging to a specific session.
-    pub async fn cleanup_session(&self, session_id: &str) {
+    async fn cleanup_session(&self, session_id: &str) {
         let session_key = format!("{SESSION_KEY_PREFIX}{session_id}");
         let mut map = self.backends.write().await;
         let stale: Vec<BackendKey> = map
@@ -804,31 +710,28 @@ impl Hub {
     }
 
     /// Kill all backend processes and wait for them to exit.
-    pub async fn shutdown(&self) {
+    async fn shutdown(&self) {
         let mut map = self.backends.write().await;
         for entry in map.values_mut() {
             entry.backend.lock().await.kill_and_wait().await;
         }
     }
 
-    /// Hot-reload: diff old vs new config, then stop removed servers,
-    /// restart changed servers, and start new ones.
-    ///
-    /// Only touches **default** (eager, Global-shared) backends.
-    /// Session- and credential-scoped instances are left alone.
-    pub async fn reload(&self, new_config: Config) {
+    /// Hot-reload backend processes: diff old vs new config, stop removed
+    /// servers, restart changed servers, start new ones. Returns whether
+    /// custom tools changed (so the caller can reload them separately).
+    async fn reload_backends(&self, new_config: &Config) -> bool {
         // Fast path: full structural equality — skip everything if identical.
         {
             let old_cfg = self.raw_config.read().await;
-            if *old_cfg == new_config {
+            if *old_cfg == *new_config {
                 debug!("config file re-read, no changes");
-                return;
+                return false;
             }
         }
 
         let empty_env = HashMap::new();
 
-        // Diff old vs new under the config read lock
         let (to_remove, to_restart, to_add, custom_changed) = {
             let old_cfg = self.raw_config.read().await;
             let old_servers = &old_cfg.servers;
@@ -853,7 +756,7 @@ impl Hub {
                         );
                         restart.push(name.clone());
                     }
-                    _ => {} // unchanged
+                    _ => {}
                 }
             }
 
@@ -868,12 +771,9 @@ impl Hub {
         };
 
         if to_remove.is_empty() && to_restart.is_empty() && to_add.is_empty() && !custom_changed {
-            // Config struct differs but no actionable server/tool changes
-            // (e.g. whitespace-only changes that parsed differently aren't possible
-            // with PartialEq, but this is a safety net)
             info!("config reloaded — no actionable changes");
-            *self.raw_config.write().await = new_config;
-            return;
+            *self.raw_config.write().await = new_config.clone();
+            return false;
         }
 
         info!(
@@ -965,16 +865,167 @@ impl Hub {
         }
 
         drop(map);
-
         self.purge_spawn_locks(&removed_keys).await;
 
-        // 4. Update custom tools if changed
+        *self.raw_config.write().await = new_config.clone();
+        custom_changed
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hub — thin routing layer combining BackendPool + CustomTools
+// ---------------------------------------------------------------------------
+
+/// The public aggregation layer. Combines a [`BackendPool`] for backend
+/// lifecycle with [`CustomTools`] for user-defined shell/HTTP tools.
+/// Exposes the unified JSON-RPC dispatch surface used by transports.
+pub struct Hub {
+    pool: Arc<BackendPool>,
+    custom: RwLock<Arc<CustomTools>>,
+}
+
+impl Hub {
+    /// Boot the hub: creates the backend pool and loads custom tools.
+    pub async fn new(raw_config: Config) -> Result<Self> {
+        let pool = Arc::new(BackendPool::new(&raw_config).await?);
+        let custom = Arc::new(CustomTools::new(&raw_config.custom_tools));
+        Ok(Self {
+            pool,
+            custom: RwLock::new(custom),
+        })
+    }
+
+    /// List tools (backend + custom), filtered by the client's server list.
+    pub async fn list_tools_for(
+        self: &Arc<Self>,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) -> (Vec<Tool>, Vec<(String, String)>) {
+        let errors = self
+            .pool
+            .ensure_backends(servers, env_overrides, session_id)
+            .await;
+        let mut tools = self
+            .pool
+            .backend_tools(servers, env_overrides, session_id)
+            .await;
+        tools.extend(self.custom.read().await.list());
+        (tools, errors)
+    }
+
+    /// Streaming version of `list_tools_for` — sends progress events as
+    /// each backend finishes, then returns the combined tool list.
+    pub async fn list_tools_streaming(
+        self: &Arc<Self>,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+        tx: mpsc::Sender<BackendProgress>,
+    ) -> (Vec<Tool>, Vec<(String, String)>) {
+        let (mut tools, errors) = self
+            .pool
+            .backend_tools_streaming(servers, env_overrides, session_id, tx)
+            .await;
+        tools.extend(self.custom.read().await.list());
+        (tools, errors)
+    }
+
+    /// Route a tool call to custom tools or the correct backend.
+    pub async fn call_tool_for(
+        &self,
+        name: &str,
+        args: Value,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) -> Result<Value, RpcError> {
+        // Check custom tools first
+        {
+            let custom = self.custom.read().await;
+            if custom.has(name) {
+                return custom.call(name, &args).await.map_err(RpcError::from);
+            }
+        }
+        self.pool
+            .call_tool(name, args, servers, env_overrides, session_id)
+            .await
+    }
+
+    /// Unified JSON-RPC method dispatch for both stdio and HTTP transports.
+    pub async fn handle_request(
+        self: &Arc<Self>,
+        method: &str,
+        params: Value,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) -> Result<Value, RpcError> {
+        match method {
+            "initialize" => Ok(serde_json::json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "mcp-proxy",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            })),
+            "notifications/initialized" => Ok(Value::Null),
+            "tools/list" => {
+                let (tools, errors) = self
+                    .list_tools_for(servers, env_overrides, session_id)
+                    .await;
+                let mut result = serde_json::json!({ "tools": tools });
+                if !errors.is_empty() {
+                    let err_list: Vec<Value> = errors
+                        .into_iter()
+                        .map(|(name, msg)| serde_json::json!({ "server": name, "error": msg }))
+                        .collect();
+                    result["_errors"] = Value::Array(err_list);
+                }
+                Ok(result)
+            }
+            "tools/call" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::InvalidParams("missing tool name".into()))?;
+                let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                self.call_tool_for(name, args, servers, env_overrides, session_id)
+                    .await
+            }
+            "resources/list" | "resources/read" => Err(RpcError::MethodNotFound(
+                "resources are not supported by mcp-proxy".into(),
+            )),
+            "prompts/list" | "prompts/get" => Err(RpcError::MethodNotFound(
+                "prompts are not supported by mcp-proxy".into(),
+            )),
+            _ => Err(RpcError::MethodNotFound(method.to_string())),
+        }
+    }
+
+    /// Health summary for /health endpoint.
+    pub async fn health(&self) -> Value {
+        self.pool.health().await
+    }
+
+    /// Kill all backends belonging to a specific session.
+    pub async fn cleanup_session(&self, session_id: &str) {
+        self.pool.cleanup_session(session_id).await;
+    }
+
+    /// Kill all backend processes and wait for them to exit.
+    pub async fn shutdown(&self) {
+        self.pool.shutdown().await;
+    }
+
+    /// Hot-reload: diff old vs new config, reload backends and custom tools.
+    pub async fn reload(&self, new_config: Config) {
+        let custom_changed = self.pool.reload_backends(&new_config).await;
         if custom_changed {
             *self.custom.write().await = Arc::new(CustomTools::new(&new_config.custom_tools));
             info!("custom tools reloaded");
         }
-
-        *self.raw_config.write().await = new_config;
         info!("config reload complete");
     }
 }
