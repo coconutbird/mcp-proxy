@@ -390,17 +390,27 @@ impl Hub {
     }
 
     /// Health summary for /health endpoint.
+    /// Does NOT expose session IDs or credential hashes.
     pub async fn health(&self) -> Value {
         let map = self.backends.read().await;
+        let mut session_count = 0u64;
         let entries: Vec<Value> = map
             .iter()
             .map(|((name, env_key), entry)| {
+                // Classify without leaking the raw key
+                let scope = if *env_key == "__default__" {
+                    "global"
+                } else if env_key.starts_with("env:") {
+                    "credentials"
+                } else {
+                    if env_key.starts_with("session:") {
+                        session_count += 1;
+                    }
+                    "session"
+                };
                 serde_json::json!({
                     "name": name,
-                    "env_key": env_key,
-                    "sharing": self.raw_config.servers.get(name)
-                        .map(|s| format!("{:?}", s.shared).to_lowercase())
-                        .unwrap_or_default(),
+                    "scope": scope,
                     "ready": entry.backend.ready,
                     "tools": entry.backend.tools.len(),
                     "idle_secs": entry.last_used.map(|t| t.elapsed().as_secs()),
@@ -408,24 +418,9 @@ impl Hub {
             })
             .collect();
 
-        // Group backends by session
-        let mut sessions: HashMap<String, Vec<String>> = HashMap::new();
-        for ((name, env_key), _) in map.iter() {
-            if let Some(sid) = env_key.strip_prefix("session:") {
-                sessions
-                    .entry(sid.to_string())
-                    .or_default()
-                    .push(name.clone());
-            }
-        }
-        let session_entries: Vec<Value> = sessions
-            .into_iter()
-            .map(|(sid, backends)| serde_json::json!({ "id": sid, "backends": backends }))
-            .collect();
-
         serde_json::json!({
             "backends": entries,
-            "active_sessions": session_entries,
+            "session_count": session_count,
         })
     }
 
