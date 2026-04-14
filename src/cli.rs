@@ -193,6 +193,11 @@ pub enum ProfileCmd {
         /// Server name to remove override for
         server: String,
     },
+    /// Interactively toggle servers and edit overrides for a profile
+    Edit {
+        /// Profile name (omit to edit the active profile)
+        name: Option<String>,
+    },
     /// Switch the active profile
     Switch {
         /// Profile name (omit to clear)
