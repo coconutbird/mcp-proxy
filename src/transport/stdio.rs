@@ -75,8 +75,16 @@ async fn handle(hub: &Hub, method: &str, params: Value) -> Result<Value> {
         })),
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
-            let tools = hub.list_tools().await;
-            Ok(serde_json::json!({ "tools": tools }))
+            let (tools, errors) = hub.list_tools().await;
+            let mut result = serde_json::json!({ "tools": tools });
+            if !errors.is_empty() {
+                let err_list: Vec<Value> = errors
+                    .into_iter()
+                    .map(|(name, msg)| serde_json::json!({ "server": name, "error": msg }))
+                    .collect();
+                result["_errors"] = Value::Array(err_list);
+            }
+            Ok(result)
         }
         "tools/call" => {
             let name = params

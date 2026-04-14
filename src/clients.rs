@@ -68,45 +68,19 @@ pub fn is_installed(client: &ClientDef) -> bool {
 /// Build the MCP server entry to write into a client config.
 /// Always uses the bridge (stdio) so session lifecycle, env forwarding,
 /// and clean disconnect all work correctly.
-pub fn mcp_entry(
-    _client: &ClientDef,
-    self_exe: &str,
-    profile: Option<&str>,
-    forward_env: &[String],
-) -> Value {
+pub fn mcp_entry(_client: &ClientDef, self_exe: &str, profile: Option<&str>) -> Value {
     let mut args = vec!["bridge".to_string()];
     if let Some(p) = profile {
         args.extend(["--profile".into(), p.into()]);
     }
-    if !forward_env.is_empty() {
-        args.push("--forward-env".into());
-        args.push(forward_env.join(","));
-    }
-    let mut entry = serde_json::json!({
+    serde_json::json!({
         "type": "stdio",
         "command": self_exe,
         "args": args,
-    });
-    // Put env var placeholders so the user knows what to fill in
-    if !forward_env.is_empty() {
-        let env_obj: serde_json::Map<String, Value> = forward_env
-            .iter()
-            .map(|k| (k.clone(), Value::String(format!("${{YOUR_{k}}}"))))
-            .collect();
-        entry
-            .as_object_mut()
-            .unwrap()
-            .insert("env".into(), Value::Object(env_obj));
-    }
-    entry
+    })
 }
 
-pub fn install(
-    client: &ClientDef,
-    self_exe: &str,
-    profile: Option<&str>,
-    forward_env: &[String],
-) -> Result<bool> {
+pub fn install(client: &ClientDef, self_exe: &str, profile: Option<&str>) -> Result<bool> {
     let mut cfg = read_config(client).unwrap_or_else(|| serde_json::json!({ client.mcp_key: {} }));
     let servers = cfg
         .as_object_mut()
@@ -114,10 +88,7 @@ pub fn install(
         .entry(client.mcp_key)
         .or_insert_with(|| serde_json::json!({}));
     let map = servers.as_object_mut().unwrap();
-    map.insert(
-        "mcp-proxy".into(),
-        mcp_entry(client, self_exe, profile, forward_env),
-    );
+    map.insert("mcp-proxy".into(), mcp_entry(client, self_exe, profile));
     write_config(client, &cfg)?;
     Ok(true)
 }

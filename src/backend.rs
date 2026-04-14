@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{ServerConfig, expand_env_with_overrides};
 
@@ -117,7 +117,7 @@ impl Backend {
         tokio::spawn(async move {
             let mut lines = BufReader::new(child_stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[{tag}] {line}");
+                debug!(server = %tag, "{line}");
             }
         });
 

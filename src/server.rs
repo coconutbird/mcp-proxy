@@ -4,8 +4,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::Value;
-use tokio::sync::RwLock;
-use tracing::info;
+use tokio::sync::{RwLock, mpsc};
+use tracing::{debug, error, info, warn};
+
+/// Progress event sent while backends are starting up.
+#[derive(Debug, Clone)]
+pub enum BackendProgress {
+    /// Backend started successfully with N tools.
+    Ready { server: String, tools: usize },
+    /// Backend failed to start.
+    Failed { server: String, error: String },
+}
 
 use crate::backend::{Backend, Tool};
 use crate::config::{Config, ServerConfig, Sharing, is_toggled_off};
@@ -33,7 +42,7 @@ fn djb2_hash(s: &str) -> u64 {
 }
 
 /// Extract the `${VAR}` references from a server config's env values and args.
-fn relevant_env_keys(srv: &ServerConfig) -> Vec<String> {
+pub fn relevant_env_keys(srv: &ServerConfig) -> Vec<String> {
     let mut keys = Vec::new();
     for val in srv.env.values() {
         extract_var_refs(val, &mut keys);
@@ -100,19 +109,19 @@ impl Hub {
         let empty_env = HashMap::new();
         let mut backends = HashMap::new();
 
-        eprintln!("starting backends:");
+        info!("starting backends");
         for (name, srv) in &raw_config.servers {
             if name.starts_with('_') {
                 continue;
             }
             if is_toggled_off(srv.env_toggle.as_deref()) {
-                eprintln!("  skipping {name} (toggled off)");
+                debug!(server = name, "skipping (toggled off)");
                 continue;
             }
             match srv.shared {
                 // Per-session: never start eagerly — spawned on connect.
                 Sharing::Session => {
-                    eprintln!("  deferring {name} (per-session)");
+                    debug!(server = name, "deferring (per-session)");
                     continue;
                 }
                 // Per-credential: only start if env vars are available now.
@@ -124,7 +133,7 @@ impl Hub {
                         .map(|s| s.as_str())
                         .collect();
                     if !missing.is_empty() {
-                        eprintln!("  deferring {name} (needs: {})", missing.join(", "));
+                        debug!(server = name, needs = missing.join(", "), "deferring");
                         continue;
                     }
                 }
@@ -132,7 +141,7 @@ impl Hub {
                 Sharing::Global => {}
             }
             let env_key = backend_env_key(srv, &empty_env);
-            eprintln!("  starting {name}");
+            info!(server = name, "starting");
             match Backend::start(name.clone(), srv, &empty_env).await {
                 Ok(be) => {
                     backends.insert(
@@ -143,7 +152,7 @@ impl Hub {
                         },
                     );
                 }
-                Err(e) => eprintln!("  failed to start {name}: {e}"),
+                Err(e) => error!(server = name, error = %e, "failed to start"),
             }
         }
 
@@ -153,9 +162,9 @@ impl Hub {
                 continue;
             }
             if srv.install.is_some() && matches!(srv.runtime, crate::config::Runtime::Docker) {
-                eprintln!("  pre-building docker image for {name}");
+                info!(server = name, "pre-building docker image");
                 if let Err(e) = crate::docker::ensure_image(name, srv).await {
-                    eprintln!("  docker pre-build failed for {name}: {e}");
+                    warn!(server = name, error = %e, "docker pre-build failed");
                 }
             }
         }
@@ -184,7 +193,7 @@ impl Hub {
                 for key in stale {
                     if let Some(mut entry) = map.remove(&key) {
                         entry.backend.kill();
-                        eprintln!("reaped idle backend: {} ({})", key.0, key.1);
+                        info!(server = %key.0, scope = %key.1, "reaped idle backend");
                     }
                 }
             }
@@ -263,12 +272,14 @@ impl Hub {
     }
 
     /// Ensure all requested backends exist (or all if `servers` is empty).
+    /// Returns a list of `(server_name, error_message)` for backends that
+    /// failed to start so callers can surface them to the client.
     async fn ensure_backends(
         &self,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
         session_id: &str,
-    ) {
+    ) -> Vec<(String, String)> {
         let names: Vec<String> = if servers.is_empty() {
             self.raw_config
                 .servers
@@ -280,11 +291,14 @@ impl Hub {
         } else {
             servers.to_vec()
         };
+        let mut errors = Vec::new();
         for name in &names {
             if let Err(e) = self.ensure_backend(name, env_overrides, session_id).await {
-                eprintln!("failed to ensure backend {name}: {e}");
+                warn!(server = name, error = %e, "failed to ensure backend");
+                errors.push((name.clone(), e.to_string()));
             }
         }
+        errors
     }
 
     /// Compute the expected backend key for a server given the client context.
@@ -304,13 +318,15 @@ impl Hub {
 
     /// List tools, filtered by the client's server include list.
     /// Empty `servers` = all servers.
+    /// Returns `(tools, errors)` — errors lists backends that failed to start.
     pub async fn list_tools_for(
         &self,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
         session_id: &str,
-    ) -> Vec<Tool> {
-        self.ensure_backends(servers, env_overrides, session_id)
+    ) -> (Vec<Tool>, Vec<(String, String)>) {
+        let errors = self
+            .ensure_backends(servers, env_overrides, session_id)
             .await;
 
         let mut map = self.backends.write().await;
@@ -334,7 +350,98 @@ impl Hub {
             out.extend(be.tools.iter().cloned());
         }
         out.extend(self.custom.list());
-        out
+        (out, errors)
+    }
+
+    /// Streaming version of `list_tools_for` — starts all backends concurrently
+    /// and sends progress events as each one finishes, then returns the final tool list.
+    pub async fn list_tools_streaming(
+        self: &Arc<Self>,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+        tx: mpsc::Sender<BackendProgress>,
+    ) -> (Vec<Tool>, Vec<(String, String)>) {
+        let names: Vec<String> = if servers.is_empty() {
+            self.raw_config
+                .servers
+                .keys()
+                .filter(|n| !n.starts_with('_'))
+                .filter(|n| !is_toggled_off(self.raw_config.servers[*n].env_toggle.as_deref()))
+                .cloned()
+                .collect()
+        } else {
+            servers.to_vec()
+        };
+
+        // Spawn all backends concurrently
+        let mut handles = Vec::new();
+        for name in names {
+            let hub = Arc::clone(self);
+            let env = env_overrides.clone();
+            let sid = session_id.to_string();
+            let progress_tx = tx.clone();
+            handles.push(tokio::spawn(async move {
+                match hub.ensure_backend(&name, &env, &sid).await {
+                    Ok(key) => {
+                        let tool_count = {
+                            let map = hub.backends.read().await;
+                            map.get(&key).map(|e| e.backend.tools.len()).unwrap_or(0)
+                        };
+                        let _ = progress_tx
+                            .send(BackendProgress::Ready {
+                                server: name.clone(),
+                                tools: tool_count,
+                            })
+                            .await;
+                        Ok((name, key))
+                    }
+                    Err(e) => {
+                        warn!(server = %name, error = %e, "failed to ensure backend");
+                        let msg = e.to_string();
+                        let _ = progress_tx
+                            .send(BackendProgress::Failed {
+                                server: name.clone(),
+                                error: msg.clone(),
+                            })
+                            .await;
+                        Err((name, msg))
+                    }
+                }
+            }));
+        }
+        drop(tx);
+
+        // Collect results
+        let mut errors = Vec::new();
+        for handle in handles {
+            if let Ok(Err((name, msg))) = handle.await {
+                errors.push((name, msg));
+            }
+        }
+
+        // Collect tools (same as list_tools_for)
+        let mut map = self.backends.write().await;
+        let mut out: Vec<Tool> = Vec::new();
+        for ((srv_name, env_key), entry) in map.iter_mut() {
+            let be = &entry.backend;
+            if !servers.is_empty() && !servers.contains(srv_name) {
+                continue;
+            }
+            let expected = match self.expected_key(srv_name, env_overrides, session_id) {
+                Some(k) => k,
+                None => continue,
+            };
+            if *env_key != expected {
+                continue;
+            }
+            if entry.last_used.is_some() {
+                entry.last_used = Some(Instant::now());
+            }
+            out.extend(be.tools.iter().cloned());
+        }
+        out.extend(self.custom.list());
+        (out, errors)
     }
 
     /// Route a tool call, respecting the client's server include list.
@@ -380,7 +487,7 @@ impl Hub {
 
     // -- Convenience wrappers: all servers, no env overrides, stdio session --
 
-    pub async fn list_tools(&self) -> Vec<Tool> {
+    pub async fn list_tools(&self) -> (Vec<Tool>, Vec<(String, String)>) {
         self.list_tools_for(&[], &HashMap::new(), "__stdio__").await
     }
 

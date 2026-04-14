@@ -13,6 +13,8 @@ use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::server::BackendProgress;
+
 use crate::server::Hub;
 
 struct Session {
@@ -74,9 +76,9 @@ pub async fn serve(hub: Arc<Hub>, port: u16) -> anyhow::Result<()> {
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    info!("http transport listening on {addr}");
-    eprintln!("  MCP endpoint: http://localhost:{port}/mcp");
-    eprintln!("  Health check: http://localhost:{port}/health");
+    info!(addr = %addr, "http transport listening");
+    info!("  MCP endpoint: http://localhost:{port}/mcp");
+    info!("  Health check: http://localhost:{port}/health");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -127,6 +129,82 @@ async fn handle_mcp(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let id = req.get("id").cloned();
 
+    // Notifications (no id) get 202 Accepted
+    let Some(req_id) = id else {
+        let _ = handle_request(
+            &state.hub,
+            &method,
+            params,
+            &servers,
+            &env_overrides,
+            &session_id,
+        )
+        .await;
+        return (StatusCode::ACCEPTED, "").into_response();
+    };
+
+    // tools/list: stream progress events via SSE, then the final result
+    if method == "tools/list" {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<BackendProgress>(32);
+        let hub = state.hub.clone();
+        let servers = servers.clone();
+        let env_overrides = env_overrides.clone();
+        let sid = session_id.clone();
+        let rid = req_id.clone();
+
+        let stream = async_stream::stream! {
+            // Spawn the backend startup work
+            let handle = tokio::spawn(async move {
+                hub.list_tools_streaming(&servers, &env_overrides, &sid, tx).await
+            });
+
+            // Yield progress events as they arrive
+            while let Some(progress) = rx.recv().await {
+                let event = match &progress {
+                    BackendProgress::Ready { server, tools } => {
+                        serde_json::json!({
+                            "_progress": true,
+                            "server": server,
+                            "status": "ready",
+                            "tools": tools,
+                        })
+                    }
+                    BackendProgress::Failed { server, error } => {
+                        serde_json::json!({
+                            "_progress": true,
+                            "server": server,
+                            "status": "failed",
+                            "error": error,
+                        })
+                    }
+                };
+                yield Ok::<_, std::convert::Infallible>(
+                    format!("data: {}\n\n", serde_json::to_string(&event).unwrap())
+                );
+            }
+
+            // All backends done — build final result
+            let (tools, errors) = handle.await.unwrap();
+            let mut result = serde_json::json!({ "tools": tools });
+            if !errors.is_empty() {
+                let err_list: Vec<Value> = errors
+                    .into_iter()
+                    .map(|(name, msg)| serde_json::json!({ "server": name, "error": msg }))
+                    .collect();
+                result["_errors"] = Value::Array(err_list);
+            }
+            let body = serde_json::json!({ "jsonrpc": "2.0", "id": rid, "result": result });
+            yield Ok(format!("data: {}\n\n", serde_json::to_string(&body).unwrap()));
+        };
+
+        return Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .header("mcp-session-id", &session_id)
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
     let result = handle_request(
         &state.hub,
         &method,
@@ -136,11 +214,6 @@ async fn handle_mcp(
         &session_id,
     )
     .await;
-
-    // Notifications (no id) get 202 Accepted
-    let Some(req_id) = id else {
-        return (StatusCode::ACCEPTED, "").into_response();
-    };
 
     let body = match result {
         Ok(val) => serde_json::json!({ "jsonrpc": "2.0", "id": req_id, "result": val }),
@@ -217,8 +290,16 @@ async fn handle_request(
         })),
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => {
-            let tools = hub.list_tools_for(servers, env_overrides, session_id).await;
-            Ok(serde_json::json!({ "tools": tools }))
+            let (tools, errors) = hub.list_tools_for(servers, env_overrides, session_id).await;
+            let mut result = serde_json::json!({ "tools": tools });
+            if !errors.is_empty() {
+                let err_list: Vec<Value> = errors
+                    .into_iter()
+                    .map(|(name, msg)| serde_json::json!({ "server": name, "error": msg }))
+                    .collect();
+                result["_errors"] = Value::Array(err_list);
+            }
+            Ok(result)
         }
         "tools/call" => {
             let name = params

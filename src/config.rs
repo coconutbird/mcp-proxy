@@ -301,34 +301,53 @@ pub fn list_profiles(profiles: &ProfilesFile) -> Vec<(&str, Option<&str>)> {
 }
 
 // ---------------------------------------------------------------------------
-// Active profile persistence (~/.config/mcp-proxy/active-profile)
+// User settings (~/.config/mcp-proxy/config.json)
 // ---------------------------------------------------------------------------
 
-fn profile_state_path() -> PathBuf {
+/// User-level settings stored in config.json.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserConfig {
+    /// Default profile to use when none is specified via CLI or env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+}
+
+fn user_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/mcp-proxy")
+        .join(".config/mcp-proxy/config.json")
+}
+
+pub fn load_user_config() -> UserConfig {
+    let path = user_config_path();
+    if !path.exists() {
+        return UserConfig::default();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_user_config(cfg: &UserConfig) -> Result<()> {
+    let path = user_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(cfg)?;
+    std::fs::write(&path, format!("{json}\n"))
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 pub fn read_active_profile() -> Option<String> {
-    let path = profile_state_path().join("active-profile");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    load_user_config().default_profile
 }
 
 pub fn write_active_profile(profile: Option<&str>) -> Result<()> {
-    let dir = profile_state_path();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("active-profile");
-    match profile {
-        Some(name) => std::fs::write(&path, name)?,
-        None => {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    Ok(())
+    let mut cfg = load_user_config();
+    cfg.default_profile = profile.map(String::from);
+    save_user_config(&cfg)
 }
 
 /// Expand `${VAR}` references, checking `overrides` first, then process env.

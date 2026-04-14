@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use tracing::{debug, info};
+
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
@@ -140,10 +142,10 @@ pub async fn ensure_image(name: &str, cfg: &ServerConfig) -> Result<()> {
         if existing == hash {
             return Ok(());
         }
-        eprintln!("  config changed for {name}, rebuilding...");
+        info!(server = name, "config changed, rebuilding docker image");
     }
 
-    eprintln!("  building docker image {tag}...");
+    info!(server = name, tag = %tag, "building docker image");
 
     // Inject the hash as a label so we can detect changes next time
     let label_arg = format!("LABEL {HASH_LABEL}=\"{hash}\"");
@@ -168,7 +170,7 @@ pub async fn ensure_image(name: &str, cfg: &ServerConfig) -> Result<()> {
         bail!("docker build failed for {name}:\n{stderr}");
     }
 
-    eprintln!("  built {tag}");
+    debug!(server = name, tag = %tag, "docker image built");
     Ok(())
 }
 

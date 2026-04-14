@@ -10,8 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::error;
-
+use tracing::{debug, error, info, warn};
 /// Collect env vars by name from the current process environment.
 fn collect_env_overrides(names: &[String]) -> HashMap<String, String> {
     names
@@ -51,8 +50,19 @@ pub async fn run(
     let client = reqwest::Client::new();
     let mut session_id: Option<String> = None;
 
-    // Start with env vars forwarded from the local process
-    let mut env_overrides = collect_env_overrides(forward_env);
+    // Auto-detect required env vars from server configs
+    let mut auto_env_keys: Vec<String> = Vec::new();
+    if let Ok(cfg) = crate::config::load(config_path) {
+        for srv in cfg.servers.values() {
+            auto_env_keys.extend(crate::server::relevant_env_keys(srv));
+        }
+        auto_env_keys.sort();
+        auto_env_keys.dedup();
+    }
+
+    // Collect auto-detected + explicit --forward-env (explicit wins on overlap)
+    let mut env_overrides = collect_env_overrides(&auto_env_keys);
+    env_overrides.extend(collect_env_overrides(forward_env));
 
     // Resolve the local profile if provided
     let mut server_list: Vec<String> = servers.to_vec();
@@ -88,13 +98,12 @@ pub async fn run(
     };
 
     if !server_list.is_empty() {
-        eprintln!("bridge requesting servers: {}", server_list.join(", "));
+        debug!(servers = server_list.join(", "), "requesting servers");
     }
     if !env_overrides.is_empty() {
-        eprintln!(
-            "bridge forwarding {} env var(s): {}",
-            env_overrides.len(),
-            env_overrides.keys().cloned().collect::<Vec<_>>().join(", ")
+        debug!(
+            vars = env_overrides.keys().cloned().collect::<Vec<_>>().join(", "),
+            "forwarding env"
         );
     }
 
@@ -102,7 +111,7 @@ pub async fn run(
     let mut stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
 
-    eprintln!("bridge connecting to {url}");
+    info!(hub = url, "bridge ready");
 
     // Shared session ID for signal handler access
     let session_id_shared: Arc<tokio::sync::Mutex<Option<String>>> =
@@ -115,10 +124,10 @@ pub async fn run(
         let sid = session_id_shared.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            eprintln!("\nbridge received ctrl+c");
+            warn!("interrupted (ctrl+c)");
             let guard = sid.lock().await;
             if let Some(ref id) = *guard {
-                eprintln!("bridge sending DELETE for session {id}");
+                info!(session = %id, "cleaning up session");
                 let _ = client
                     .delete(&url)
                     .header("mcp-session-id", id)
@@ -153,42 +162,98 @@ pub async fn run(
         }
 
         match req.body(line).send().await {
-            Ok(resp) => {
-                // Capture session id
+            Ok(mut resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    error!(status = %status, body = body, "hub returned error");
+                    let err = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32000, "message": format!("hub returned HTTP {status}") }
+                    });
+                    let out = serde_json::to_string(&err)?;
+                    stdout.write_all(out.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                    continue;
+                }
+
+                // Capture session id on first response
                 if let Some(sid_hdr) = resp.headers().get("mcp-session-id") {
                     let new_sid = sid_hdr.to_str().ok().map(String::from);
+                    if session_id.is_none() && new_sid.is_some() {
+                        info!("connected");
+                    }
                     session_id = new_sid.clone();
-                    // Update shared copy for signal handler
                     *session_id_shared.lock().await = new_sid;
                 }
 
-                let ct = resp
+                let is_sse = resp
                     .headers()
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
-                    .to_string();
-                let body = resp.text().await.unwrap_or_default();
+                    .contains("text/event-stream");
 
-                if ct.contains("text/event-stream") {
-                    // Parse SSE events, extract data lines
-                    for event_line in body.lines() {
-                        if let Some(data) = event_line.strip_prefix("data: ") {
-                            let data = data.trim();
-                            if !data.is_empty() {
+                if is_sse {
+                    // Stream SSE chunks as they arrive
+                    let mut buf = String::new();
+                    while let Some(chunk) = resp.chunk().await? {
+                        buf.push_str(&String::from_utf8_lossy(&chunk));
+                        // Process complete lines
+                        while let Some(pos) = buf.find('\n') {
+                            let line = buf[..pos].trim().to_string();
+                            buf = buf[pos + 1..].to_string();
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                let data = data.trim();
+                                if data.is_empty() {
+                                    continue;
+                                }
+                                // Progress events → log to stderr, don't forward
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+                                    && v.get("_progress").is_some()
+                                {
+                                    let server =
+                                        v.get("server").and_then(|s| s.as_str()).unwrap_or("?");
+                                    let status =
+                                        v.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+                                    match status {
+                                        "ready" => {
+                                            let tools = v
+                                                .get("tools")
+                                                .and_then(|t| t.as_u64())
+                                                .unwrap_or(0);
+                                            info!(server = server, tools = tools, "backend ready");
+                                        }
+                                        "failed" => {
+                                            let err = v
+                                                .get("error")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or("?");
+                                            warn!(server = server, "{err}");
+                                        }
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
+                                // Regular JSON-RPC data → forward to client
                                 stdout.write_all(data.as_bytes()).await?;
                                 stdout.write_all(b"\n").await?;
+                                stdout.flush().await?;
                             }
                         }
                     }
-                } else if !body.trim().is_empty() {
-                    stdout.write_all(body.trim().as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
+                } else {
+                    let body = resp.text().await.unwrap_or_default();
+                    if !body.trim().is_empty() {
+                        stdout.write_all(body.trim().as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                    }
+                    stdout.flush().await?;
                 }
-                stdout.flush().await?;
             }
             Err(e) => {
-                error!("bridge request failed: {e}");
+                error!(error = %e, "request failed");
                 let err = serde_json::json!({
                     "jsonrpc": "2.0",
                     "error": { "code": -32000, "message": format!("bridge error: {e}") }
@@ -202,8 +267,9 @@ pub async fn run(
     }
 
     // Client disconnected — tell the server to clean up our session.
+    info!("stdin closed, disconnecting");
     if let Some(ref sid) = session_id {
-        eprintln!("bridge disconnecting, sending DELETE for session {sid}");
+        info!(session = %sid, "cleaning up session");
         let _ = client
             .delete(url)
             .header("mcp-session-id", sid)

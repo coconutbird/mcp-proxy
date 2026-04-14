@@ -36,6 +36,8 @@ dirs = "6"
 # Interactive prompts (for client selection)
 dialoguer = "0.11"
 base64 = "0.22.1"
+async-stream = "0.3.6"
+tokio-stream = "0.1.18"
 
 [profile.release]
 opt-level = 3

@@ -77,7 +77,7 @@ async fn cmd_serve(
     let hub2 = hub.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        eprintln!("\nshutting down...");
+        tracing::info!("shutting down");
         hub2.shutdown().await;
         std::process::exit(0);
     });
@@ -121,7 +121,7 @@ fn cmd_clients(profile: Option<&str>) -> Result<()> {
     for (i, client) in available.iter().enumerate() {
         if selected_set.contains(&i) {
             let was_installed = clients::is_installed(client);
-            clients::install(client, &self_exe, profile, &[])?;
+            clients::install(client, &self_exe, profile)?;
             if was_installed {
                 eprintln!("  🔄 synced {}", client.name);
             } else {
