@@ -95,6 +95,10 @@ struct BackendEntry {
     crashed: Arc<AtomicBool>,
 }
 
+/// Resolved target of a prefixed tool-name lookup: the owning backend,
+/// the original (un-prefixed) tool name, and the health-atomics handle.
+type ToolTarget = (Arc<TokioMutex<Backend>>, String, HealthSync);
+
 /// Lightweight handle for syncing backend health atomics after a tool call.
 /// Cloning `Arc<AtomicX>` is cheap and avoids holding a reference to the entry.
 struct HealthSync {
@@ -685,7 +689,8 @@ impl BackendPool {
         (tools, errors)
     }
 
-    /// Route a tool call to the correct backend.
+    /// Route a tool call to the correct backend. If the backend was reaped
+    /// for idleness, respawn it on demand before returning `ToolNotFound`.
     ///
     /// Uses backend-entry cached sharing info so we only need the backends
     /// read-lock — no config lock on the hot path.
@@ -697,35 +702,100 @@ impl BackendPool {
         env_overrides: &HashMap<String, String>,
         session_id: &str,
     ) -> Result<Value, RpcError> {
-        let map = self.backends.read().await;
+        if let Some(found) = self
+            .find_tool_backend(name, servers, env_overrides, session_id)
+            .await
+        {
+            return Self::invoke_found(found, args).await;
+        }
 
-        // We need both the backend Arc AND health-sync atomics.
-        let (be_arc, original_name, health_sync) = {
-            let mut found = None;
-            for (key, entry) in map.iter() {
-                if !servers.is_empty() && !servers.contains(&key.server) {
-                    continue;
-                }
-                let prefix = format!("{}_", key.server);
-                if let Some(original) = name.strip_prefix(&prefix) {
-                    let expected = entry.expected_scope(env_overrides, session_id);
-                    if key.scope == expected {
-                        entry.touch();
-                        // Capture atomics for post-call sync (cheap Arc clones).
-                        let sync = entry.health_sync();
-                        found = Some((entry.backend.clone(), original.to_string(), sync));
-                    }
-                    break;
-                }
-            }
-            // Drop lock before awaiting the backend mutex.
-            drop(map);
-            match found {
-                Some(f) => f,
-                None => return Err(RpcError::ToolNotFound(name.to_string())),
-            }
+        // Miss: backend may have been reaped. Find the owning server from
+        // config and respawn, then retry once.
+        let Some(server_name) = self.server_for_tool(name, servers).await else {
+            return Err(RpcError::ToolNotFound(name.to_string()));
         };
+        info!(server = %server_name, tool = %name, "respawning reaped backend for tool call");
+        self.ensure_backend(&server_name, env_overrides, session_id)
+            .await
+            .map_err(|e| {
+                RpcError::Internal(format!("failed to respawn backend '{server_name}': {e}"))
+            })?;
 
+        match self
+            .find_tool_backend(name, servers, env_overrides, session_id)
+            .await
+        {
+            Some(found) => Self::invoke_found(found, args).await,
+            None => Err(RpcError::ToolNotFound(name.to_string())),
+        }
+    }
+
+    /// Look up a (backend, original_tool_name, health_sync) triple for a
+    /// prefixed tool name. Prefers the longest matching server prefix so that
+    /// servers whose names share a prefix (e.g. `github` vs `github_archive`)
+    /// resolve unambiguously.
+    async fn find_tool_backend(
+        &self,
+        name: &str,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) -> Option<ToolTarget> {
+        let map = self.backends.read().await;
+        let mut best: Option<(usize, ToolTarget)> = None;
+        for (key, entry) in map.iter() {
+            if !servers.is_empty() && !servers.contains(&key.server) {
+                continue;
+            }
+            let prefix = format!("{}_", key.server);
+            let Some(original) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let expected = entry.expected_scope(env_overrides, session_id);
+            if key.scope != expected {
+                continue;
+            }
+            let plen = prefix.len();
+            if best.as_ref().is_none_or(|(l, _)| plen > *l) {
+                entry.touch();
+                let found = (
+                    entry.backend.clone(),
+                    original.to_string(),
+                    entry.health_sync(),
+                );
+                best = Some((plen, found));
+            }
+        }
+        best.map(|(_, v)| v)
+    }
+
+    /// Find the configured server whose `{name}_` prefix matches the tool,
+    /// preferring the longest match. Honors the `servers` filter and skips
+    /// disabled servers.
+    async fn server_for_tool(&self, name: &str, servers: &[String]) -> Option<String> {
+        let cfg = self.raw_config.read().await;
+        let mut best: Option<(usize, String)> = None;
+        for (srv_name, srv) in &cfg.servers {
+            if !servers.is_empty() && !servers.contains(srv_name) {
+                continue;
+            }
+            if is_server_disabled(srv_name, srv) {
+                continue;
+            }
+            let prefix_len = srv_name.len() + 1;
+            if name.len() > prefix_len
+                && name.starts_with(srv_name.as_str())
+                && name.as_bytes()[srv_name.len()] == b'_'
+                && best.as_ref().is_none_or(|(l, _)| prefix_len > *l)
+            {
+                best = Some((prefix_len, srv_name.clone()));
+            }
+        }
+        best.map(|(_, n)| n)
+    }
+
+    async fn invoke_found(found: ToolTarget, args: Value) -> Result<Value, RpcError> {
+        let (be_arc, original_name, health_sync) = found;
         let mut be = be_arc.lock().await;
         let result = be.call_tool(&original_name, args).await;
         // Sync atomics in case call_tool triggered an auto-restart.
