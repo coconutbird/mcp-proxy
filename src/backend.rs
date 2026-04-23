@@ -25,12 +25,15 @@ use crate::jsonrpc;
 /// Default RPC timeout if not configured per-server.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-/// A tool discovered from a backend, namespaced as <backend>_<tool>.
+/// A tool discovered from a backend, namespaced as `<backend>_<tool>`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Tool {
+    /// Namespaced name exposed to MCP clients (e.g. `github_search_issues`).
     pub name: String,
+    /// Human-readable description forwarded from the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// JSON Schema for the tool's arguments, as reported by the backend.
     #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
     /// The original tool name before namespacing (used for filtering/aliases).
@@ -72,9 +75,17 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 type Pending = HashMap<u64, oneshot::Sender<Result<Value>>>;
 
 /// A running MCP server subprocess managed by the hub.
+///
+/// Owns the child process's stdin and routes JSON-RPC responses from stdout
+/// to waiting futures via `pending`. Crash detection fires when stdout
+/// closes; [`Backend::call_tool`] auto-restarts on the next call if
+/// `auto_restart` is enabled in the server config.
 pub struct Backend {
+    /// Server name from config (used for log tagging and tool namespacing).
     pub name: String,
+    /// Tools discovered during handshake, post-filtering and aliasing.
     pub tools: Vec<Tool>,
+    /// `true` once the MCP `initialize` handshake has completed successfully.
     pub ready: bool,
     /// Number of times this backend has been restarted after a crash.
     pub restart_count: u32,
@@ -230,38 +241,47 @@ impl Backend {
 
     /// Apply include/exclude tool filters and aliases from the config.
     fn apply_tool_filters(&mut self) {
-        let cfg = &self.cfg_snapshot;
+        apply_tool_filters(&mut self.tools, &self.name, &self.cfg_snapshot);
+    }
+}
 
-        // Apply include filter
-        if !cfg.include_tools.is_empty() {
-            self.tools.retain(|t| {
-                cfg.include_tools
-                    .iter()
-                    .any(|pat| glob_match(pat, &t.original_name))
-            });
-        }
-
-        // Apply exclude filter
-        if !cfg.exclude_tools.is_empty() {
-            self.tools.retain(|t| {
-                !cfg.exclude_tools
-                    .iter()
-                    .any(|pat| glob_match(pat, &t.original_name))
-            });
-        }
-
-        // Apply aliases: add aliased copies of tools
-        let mut aliased: Vec<Tool> = Vec::new();
-        for (alias, original) in &cfg.tool_aliases {
-            if let Some(t) = self.tools.iter().find(|t| t.original_name == *original) {
-                let mut cloned = t.clone();
-                cloned.name = format!("{}_{alias}", self.name);
-                aliased.push(cloned);
-            }
-        }
-        self.tools.extend(aliased);
+/// Apply include/exclude filters and aliases to a backend's tool list.
+///
+/// - `include_tools`: if non-empty, only tools whose original name matches
+///   at least one glob are kept.
+/// - `exclude_tools`: tools whose original name matches any glob are dropped
+///   (applied after include).
+/// - `tool_aliases`: for each `{alias} -> {original}` pair, adds a cloned
+///   tool named `<server>_<alias>` alongside the original.
+fn apply_tool_filters(tools: &mut Vec<Tool>, server_name: &str, cfg: &ServerConfig) {
+    if !cfg.include_tools.is_empty() {
+        tools.retain(|t| {
+            cfg.include_tools
+                .iter()
+                .any(|pat| glob_match(pat, &t.original_name))
+        });
     }
 
+    if !cfg.exclude_tools.is_empty() {
+        tools.retain(|t| {
+            !cfg.exclude_tools
+                .iter()
+                .any(|pat| glob_match(pat, &t.original_name))
+        });
+    }
+
+    let mut aliased: Vec<Tool> = Vec::new();
+    for (alias, original) in &cfg.tool_aliases {
+        if let Some(t) = tools.iter().find(|t| t.original_name == *original) {
+            let mut cloned = t.clone();
+            cloned.name = format!("{server_name}_{alias}");
+            aliased.push(cloned);
+        }
+    }
+    tools.extend(aliased);
+}
+
+impl Backend {
     /// Returns true if the backend process has crashed.
     pub fn has_crashed(&self) -> bool {
         self.crashed.load(Ordering::Acquire)
@@ -525,5 +545,111 @@ mod tests {
     fn glob_double_star() {
         assert!(glob_match("a*b*c", "aXbYc"));
         assert!(!glob_match("a*b*c", "aXbY"));
+    }
+
+    // ---------------------------------------------------------------------
+    // apply_tool_filters
+    // ---------------------------------------------------------------------
+
+    fn tool(name: &str) -> Tool {
+        Tool {
+            name: format!("srv_{name}"),
+            description: None,
+            input_schema: None,
+            original_name: name.to_string(),
+        }
+    }
+
+    fn cfg_with(include: &[&str], exclude: &[&str], aliases: &[(&str, &str)]) -> ServerConfig {
+        ServerConfig {
+            command: "echo".into(),
+            include_tools: include.iter().map(|s| s.to_string()).collect(),
+            exclude_tools: exclude.iter().map(|s| s.to_string()).collect(),
+            tool_aliases: aliases
+                .iter()
+                .map(|(a, o)| (a.to_string(), o.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn filters_noop_when_no_rules() {
+        let mut tools = vec![tool("read"), tool("write")];
+        apply_tool_filters(&mut tools, "srv", &cfg_with(&[], &[], &[]));
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn include_filter_keeps_only_matching() {
+        let mut tools = vec![tool("read_file"), tool("write_file"), tool("list_dirs")];
+        apply_tool_filters(&mut tools, "srv", &cfg_with(&["*_file"], &[], &[]));
+        let names: Vec<&str> = tools.iter().map(|t| t.original_name.as_str()).collect();
+        assert_eq!(names, vec!["read_file", "write_file"]);
+    }
+
+    #[test]
+    fn exclude_filter_removes_matching() {
+        let mut tools = vec![tool("read_file"), tool("delete_file"), tool("list")];
+        apply_tool_filters(&mut tools, "srv", &cfg_with(&[], &["delete_*"], &[]));
+        let names: Vec<&str> = tools.iter().map(|t| t.original_name.as_str()).collect();
+        assert_eq!(names, vec!["read_file", "list"]);
+    }
+
+    #[test]
+    fn include_then_exclude() {
+        let mut tools = vec![
+            tool("read_file"),
+            tool("write_file"),
+            tool("delete_file"),
+            tool("ignored"),
+        ];
+        apply_tool_filters(
+            &mut tools,
+            "srv",
+            &cfg_with(&["*_file"], &["delete_*"], &[]),
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.original_name.as_str()).collect();
+        assert_eq!(names, vec!["read_file", "write_file"]);
+    }
+
+    #[test]
+    fn alias_adds_tool_with_prefixed_name() {
+        let mut tools = vec![tool("search_repositories")];
+        apply_tool_filters(
+            &mut tools,
+            "gh",
+            &cfg_with(&[], &[], &[("search", "search_repositories")]),
+        );
+        assert_eq!(tools.len(), 2);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"srv_search_repositories"));
+        assert!(names.contains(&"gh_search"));
+        // Alias preserves the original name so call_tool routes correctly.
+        let alias_tool = tools.iter().find(|t| t.name == "gh_search").unwrap();
+        assert_eq!(alias_tool.original_name, "search_repositories");
+    }
+
+    #[test]
+    fn alias_for_unknown_tool_is_ignored() {
+        let mut tools = vec![tool("read")];
+        apply_tool_filters(
+            &mut tools,
+            "srv",
+            &cfg_with(&[], &[], &[("shortcut", "nonexistent")]),
+        );
+        assert_eq!(tools.len(), 1);
+    }
+
+    #[test]
+    fn alias_runs_after_filters() {
+        // Excluded original tool → no alias.
+        let mut tools = vec![tool("dangerous")];
+        apply_tool_filters(
+            &mut tools,
+            "srv",
+            &cfg_with(&[], &["dangerous"], &[("safe", "dangerous")]),
+        );
+        assert_eq!(tools.len(), 0, "alias should not resurrect excluded tool");
     }
 }

@@ -187,3 +187,251 @@ impl Hub {
         info!("config reload complete");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end Hub dispatch tests using a python mock MCP server.
+
+    use super::*;
+    use crate::config::{ServerConfig, Sharing};
+
+    /// Minimal MCP server: responds to initialize / tools/list / tools/call.
+    const MOCK_MCP_SERVER: &str = r#"
+import json, os, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+    except Exception:
+        continue
+    if "id" not in req:
+        continue
+    m = req.get("method", "")
+    if m == "initialize":
+        r = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0"}}
+    elif m == "tools/list":
+        r = {"tools":[{"name":"ping","description":"","inputSchema":{"type":"object"}}]}
+    elif m == "tools/call":
+        r = {"pid": os.getpid()}
+    else:
+        sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":req["id"],"error":{"code":-32601,"message":"not found"}}) + "\n")
+        sys.stdout.flush()
+        continue
+    sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":r}) + "\n")
+    sys.stdout.flush()
+"#;
+
+    fn have_python3() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    fn write_mock_script(label: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!("mcp_hub_test_{label}_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let script = tmp.join("mock.py");
+        std::fs::write(&script, MOCK_MCP_SERVER).unwrap();
+        script
+    }
+
+    fn mock_config(script: &std::path::Path) -> Config {
+        let srv = ServerConfig {
+            command: "python3".into(),
+            args: vec![script.display().to_string()],
+            shared: Sharing::Session,
+            ..Default::default()
+        };
+        let mut servers = HashMap::new();
+        servers.insert("fake".to_string(), srv);
+        Config {
+            servers,
+            ..Default::default()
+        }
+    }
+
+    async fn empty_hub() -> Arc<Hub> {
+        Arc::new(Hub::new(Config::default()).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_protocol_version() {
+        let hub = empty_hub().await;
+        let resp = hub
+            .handle_request("initialize", Value::Null, &[], &HashMap::new(), "sess")
+            .await
+            .unwrap();
+        assert_eq!(resp["protocolVersion"], MCP_PROTOCOL_VERSION);
+        assert!(resp["capabilities"]["tools"].is_object());
+        assert_eq!(resp["serverInfo"]["name"], "mcp-proxy");
+    }
+
+    #[tokio::test]
+    async fn initialized_notification_returns_null() {
+        let hub = empty_hub().await;
+        let resp = hub
+            .handle_request(
+                "notifications/initialized",
+                Value::Null,
+                &[],
+                &HashMap::new(),
+                "sess",
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn unknown_method_returns_method_not_found() {
+        let hub = empty_hub().await;
+        let err = hub
+            .handle_request("nope/nope", Value::Null, &[], &HashMap::new(), "sess")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::MethodNotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn resources_and_prompts_rejected() {
+        let hub = empty_hub().await;
+        for method in [
+            "resources/list",
+            "resources/read",
+            "prompts/list",
+            "prompts/get",
+        ] {
+            let err = hub
+                .handle_request(method, Value::Null, &[], &HashMap::new(), "sess")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RpcError::MethodNotFound(_)),
+                "{method}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_call_missing_name_is_invalid_params() {
+        let hub = empty_hub().await;
+        let err = hub
+            .handle_request(
+                "tools/call",
+                serde_json::json!({}),
+                &[],
+                &HashMap::new(),
+                "sess",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::InvalidParams(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn tools_call_unknown_tool_returns_tool_not_found() {
+        let hub = empty_hub().await;
+        let err = hub
+            .handle_request(
+                "tools/call",
+                serde_json::json!({"name": "ghost_do_thing"}),
+                &[],
+                &HashMap::new(),
+                "sess",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RpcError::ToolNotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn cleanup_session_kills_only_that_session() {
+        if !have_python3() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let script = write_mock_script("cleanup");
+        let hub = Arc::new(Hub::new(mock_config(&script)).await.unwrap());
+        let env = HashMap::new();
+
+        // Spawn backends under two sessions via a tool call each.
+        for sid in ["sess-a", "sess-b"] {
+            hub.handle_request(
+                "tools/call",
+                serde_json::json!({"name": "fake_ping", "arguments": {}}),
+                &[],
+                &env,
+                sid,
+            )
+            .await
+            .unwrap();
+        }
+
+        let health = hub.health().await;
+        let backends = health["backends"].as_array().unwrap();
+        assert_eq!(backends.len(), 2, "two session-scoped backends: {health}");
+
+        // Tear down one session; the other must survive.
+        hub.cleanup_session("sess-a").await;
+
+        let health = hub.health().await;
+        let backends = health["backends"].as_array().unwrap();
+        assert_eq!(backends.len(), 1, "one backend left: {health}");
+        // The surviving backend should be the other session.
+        assert_eq!(backends[0]["scope"], "session");
+
+        // A follow-up call on the cleaned-up session should respawn cleanly.
+        hub.handle_request(
+            "tools/call",
+            serde_json::json!({"name": "fake_ping", "arguments": {}}),
+            &[],
+            &env,
+            "sess-a",
+        )
+        .await
+        .expect("respawn after cleanup");
+
+        let health = hub.health().await;
+        assert_eq!(health["backends"].as_array().unwrap().len(), 2);
+
+        hub.shutdown().await;
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn tools_list_and_call_end_to_end() {
+        if !have_python3() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let script = write_mock_script("e2e");
+        let hub = Arc::new(Hub::new(mock_config(&script)).await.unwrap());
+
+        let env = HashMap::new();
+        let list = hub
+            .handle_request("tools/list", Value::Null, &[], &env, "sess")
+            .await
+            .unwrap();
+        let tools = list["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1, "one tool expected: {list}");
+        assert_eq!(tools[0]["name"], "fake_ping");
+
+        let result = hub
+            .handle_request(
+                "tools/call",
+                serde_json::json!({"name": "fake_ping", "arguments": {}}),
+                &[],
+                &env,
+                "sess",
+            )
+            .await
+            .unwrap();
+        assert!(result.get("pid").is_some(), "expected pid field: {result}");
+
+        hub.shutdown().await;
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+}

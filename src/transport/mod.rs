@@ -12,6 +12,8 @@ pub mod stdio;
 // Shared header / content-type constants used by HTTP and bridge transports
 // ---------------------------------------------------------------------------
 
+/// Canonical HTTP header names exchanged between the bridge and the HTTP
+/// transport.
 pub mod headers {
     /// Session identifier header (both directions).
     pub const SESSION_ID: &str = "mcp-session-id";
@@ -21,8 +23,11 @@ pub mod headers {
     pub const SERVERS: &str = "x-mcp-servers";
 }
 
+/// HTTP `Content-Type` values used by the HTTP transport.
 pub mod content_types {
+    /// Ordinary JSON-RPC response.
     pub const JSON: &str = "application/json";
+    /// Server-Sent Events stream (used for `tools/list` progress).
     pub const SSE: &str = "text/event-stream";
 }
 

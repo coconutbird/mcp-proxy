@@ -15,13 +15,18 @@ use serde_json::Value;
 /// An outgoing JSON-RPC 2.0 request (sent to backends).
 #[derive(Debug, Serialize)]
 pub struct Request<'a> {
+    /// Protocol version — always `"2.0"`.
     pub jsonrpc: &'static str,
+    /// Request id; response must echo it back.
     pub id: u64,
+    /// Method name (e.g. `"tools/list"`, `"tools/call"`).
     pub method: &'a str,
+    /// Method parameters (JSON object or array).
     pub params: Value,
 }
 
 impl<'a> Request<'a> {
+    /// Construct a request with `jsonrpc: "2.0"` pre-filled.
     pub fn new(id: u64, method: &'a str, params: Value) -> Self {
         Self {
             jsonrpc: "2.0",
@@ -32,15 +37,19 @@ impl<'a> Request<'a> {
     }
 }
 
-/// An outgoing JSON-RPC 2.0 notification (no `id`).
+/// An outgoing JSON-RPC 2.0 notification (no `id`, no response expected).
 #[derive(Debug, Serialize)]
 pub struct Notification<'a> {
+    /// Protocol version — always `"2.0"`.
     pub jsonrpc: &'static str,
+    /// Method name (e.g. `"notifications/initialized"`).
     pub method: &'a str,
+    /// Method parameters.
     pub params: Value,
 }
 
 impl<'a> Notification<'a> {
+    /// Construct a notification with `jsonrpc: "2.0"` pre-filled.
     pub fn new(method: &'a str, params: Value) -> Self {
         Self {
             jsonrpc: "2.0",
@@ -50,11 +59,15 @@ impl<'a> Notification<'a> {
     }
 }
 
-/// An incoming JSON-RPC 2.0 response from a backend.
+/// An incoming JSON-RPC 2.0 response from a backend. Exactly one of
+/// `result` or `error` should be set.
 #[derive(Debug, Deserialize)]
 pub struct Response {
+    /// Echoes the request's id (missing only on malformed backends).
     pub id: Option<u64>,
+    /// Success payload.
     pub result: Option<Value>,
+    /// Error payload.
     pub error: Option<WireError>,
 }
 
@@ -124,6 +137,7 @@ pub enum RpcError {
 }
 
 impl RpcError {
+    /// The JSON-RPC error code this variant maps to.
     pub fn code(&self) -> i64 {
         match self {
             Self::MethodNotFound(_) => codes::METHOD_NOT_FOUND,
@@ -133,6 +147,7 @@ impl RpcError {
         }
     }
 
+    /// Serialize as a JSON-RPC 2.0 error response bound to `id`.
     pub fn to_json(&self, id: &Value) -> Value {
         err(id, self.code(), &self.to_string())
     }
@@ -141,5 +156,98 @@ impl RpcError {
 impl From<anyhow::Error> for RpcError {
     fn from(e: anyhow::Error) -> Self {
         Self::Internal(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_has_jsonrpc_2_0() {
+        let req = Request::new(42, "tools/list", json!({}));
+        let s = serde_json::to_string(&req).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 42);
+        assert_eq!(v["method"], "tools/list");
+    }
+
+    #[test]
+    fn notification_has_no_id() {
+        let n = Notification::new("notifications/initialized", json!({}));
+        let v: Value = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["method"], "notifications/initialized");
+        assert!(v.get("id").is_none());
+    }
+
+    #[test]
+    fn response_deserializes_success() {
+        let raw = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let resp: Response = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.id, Some(1));
+        assert_eq!(resp.result.unwrap()["ok"], true);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn response_deserializes_error() {
+        let raw = r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"nope"}}"#;
+        let resp: Response = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.id, Some(7));
+        assert!(resp.result.is_none());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32601);
+        assert_eq!(err.message, "nope");
+    }
+
+    #[test]
+    fn ok_builder() {
+        let v = ok(&json!(1), json!({"x": 2}));
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["x"], 2);
+    }
+
+    #[test]
+    fn err_builder() {
+        let v = err(&json!("abc"), -32601, "missing");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], "abc");
+        assert_eq!(v["error"]["code"], -32601);
+        assert_eq!(v["error"]["message"], "missing");
+    }
+
+    #[test]
+    fn rpc_error_codes() {
+        assert_eq!(
+            RpcError::MethodNotFound("x".into()).code(),
+            codes::METHOD_NOT_FOUND
+        );
+        assert_eq!(
+            RpcError::InvalidParams("x".into()).code(),
+            codes::INVALID_PARAMS
+        );
+        assert_eq!(
+            RpcError::ToolNotFound("x".into()).code(),
+            codes::TOOL_NOT_FOUND
+        );
+        assert_eq!(RpcError::Internal("x".into()).code(), codes::INTERNAL);
+    }
+
+    #[test]
+    fn rpc_error_to_json_maps_code_and_message() {
+        let v = RpcError::ToolNotFound("ghost".into()).to_json(&json!(5));
+        assert_eq!(v["id"], 5);
+        assert_eq!(v["error"]["code"], codes::TOOL_NOT_FOUND);
+        assert_eq!(v["error"]["message"], "unknown tool: ghost");
+    }
+
+    #[test]
+    fn rpc_error_from_anyhow() {
+        let e: RpcError = anyhow::anyhow!("boom").into();
+        assert!(matches!(e, RpcError::Internal(ref m) if m == "boom"));
     }
 }
