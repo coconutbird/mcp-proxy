@@ -626,6 +626,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extract_var_names_basic() {
+        assert_eq!(extract_var_names("--token=${TOKEN}"), vec!["TOKEN"]);
+    }
+
+    #[test]
+    fn extract_var_names_multiple() {
+        assert_eq!(extract_var_names("${A}_${B}_plain"), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn extract_var_names_none() {
+        assert!(extract_var_names("no vars here").is_empty());
+    }
+
+    #[test]
     fn expand_env_no_vars() {
         let out = expand_env_with_overrides("plain text", &HashMap::new());
         assert_eq!(out, "plain text");
