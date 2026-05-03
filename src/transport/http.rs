@@ -228,7 +228,7 @@ async fn handle_mcp(
         let stream = async_stream::stream! {
             // Spawn the backend startup work
             let handle = tokio::spawn(async move {
-                hub.list_tools_streaming(&servers, &env_overrides, &sid, tx).await
+                hub.list_tools(&servers, &env_overrides, &sid, Some(tx)).await
             });
 
             // Yield progress events as they arrive

@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as TokioMutex;
 
-use super::env_key::{DEFAULT_ENV_KEY, ENV_KEY_PREFIX, SESSION_KEY_PREFIX, relevant_env_keys};
 use crate::backend::Backend;
 use crate::config::{ServerConfig, Sharing};
 
@@ -49,14 +48,9 @@ pub(super) type SpawnLocks = Arc<TokioMutex<HashMap<BackendKey, Arc<TokioMutex<(
 /// `last_used_ms` is atomic so hot-path lookups can bump it under a *read*
 /// lock instead of requiring a write lock per request. [`NOT_REAPABLE`] means
 /// the entry is never reaped.
-///
-/// `sharing` and `env_key_vars` are cached from the server config at spawn
-/// time so scope matching on the hot path doesn't need the config lock.
 pub(super) struct BackendEntry {
     pub(super) backend: Arc<TokioMutex<Backend>>,
     last_used_ms: AtomicU64,
-    sharing: Sharing,
-    env_key_vars: Vec<String>,
     // --- Atomic health snapshot (lock-free reads for /health) ---
     pub(super) tool_count: Arc<AtomicU64>,
     pub(super) ready: Arc<AtomicBool>,
@@ -80,8 +74,6 @@ impl BackendEntry {
             } else {
                 NOT_REAPABLE
             }),
-            sharing: srv.shared.clone(),
-            env_key_vars: relevant_env_keys(srv),
             tool_count: Arc::new(AtomicU64::new(tool_count)),
             ready: Arc::new(AtomicBool::new(ready)),
             restart_count: Arc::new(AtomicU64::new(restart_count)),
@@ -117,35 +109,6 @@ impl BackendEntry {
 
     fn is_reapable(&self) -> bool {
         self.last_used_ms.load(Ordering::Relaxed) != NOT_REAPABLE
-    }
-
-    /// Compute the expected scope key for this entry using cached sharing
-    /// info — no config lock required.
-    pub(super) fn expected_scope(
-        &self,
-        env_overrides: &HashMap<String, String>,
-        session_id: &str,
-    ) -> String {
-        match self.sharing {
-            Sharing::Global => DEFAULT_ENV_KEY.to_string(),
-            Sharing::Session => format!("{SESSION_KEY_PREFIX}{session_id}"),
-            Sharing::Credentials => {
-                let relevant: Vec<&String> = self
-                    .env_key_vars
-                    .iter()
-                    .filter(|k| env_overrides.contains_key(k.as_str()))
-                    .collect();
-                if relevant.is_empty() {
-                    return DEFAULT_ENV_KEY.to_string();
-                }
-                let s = relevant
-                    .iter()
-                    .map(|k| format!("{}={}", k, env_overrides.get(k.as_str()).unwrap()))
-                    .collect::<Vec<_>>()
-                    .join("\0");
-                format!("{ENV_KEY_PREFIX}{:x}", crate::util::fnv1a(&s))
-            }
-        }
     }
 }
 

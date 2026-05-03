@@ -55,35 +55,18 @@ impl Hub {
     }
 
     /// List tools (backend + custom), filtered by the client's server list.
-    pub async fn list_tools_for(
+    /// Pass `Some(tx)` to receive a [`BackendProgress`] event per backend as
+    /// it finishes spawning (used by HTTP for SSE); `None` runs silent.
+    pub async fn list_tools(
         self: &Arc<Self>,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
         session_id: &str,
-    ) -> (Vec<Tool>, Vec<(String, String)>) {
-        let errors = self
-            .pool
-            .ensure_backends(servers, env_overrides, session_id)
-            .await;
-        let mut tools = self
-            .pool
-            .backend_tools(servers, env_overrides, session_id)
-            .await;
-        tools.extend(self.custom.read().await.list());
-        (tools, errors)
-    }
-
-    /// Streaming version of `list_tools_for`.
-    pub async fn list_tools_streaming(
-        self: &Arc<Self>,
-        servers: &[String],
-        env_overrides: &HashMap<String, String>,
-        session_id: &str,
-        tx: mpsc::Sender<BackendProgress>,
+        progress: Option<mpsc::Sender<BackendProgress>>,
     ) -> (Vec<Tool>, Vec<(String, String)>) {
         let (mut tools, errors) = self
             .pool
-            .backend_tools_streaming(servers, env_overrides, session_id, tx)
+            .list_tools(servers, env_overrides, session_id, progress)
             .await;
         tools.extend(self.custom.read().await.list());
         (tools, errors)
@@ -130,7 +113,7 @@ impl Hub {
             "notifications/initialized" => Ok(Value::Null),
             "tools/list" => {
                 let (tools, errors) = self
-                    .list_tools_for(servers, env_overrides, session_id)
+                    .list_tools(servers, env_overrides, session_id, None)
                     .await;
                 let mut result = serde_json::json!({ "tools": tools });
                 if !errors.is_empty() {
@@ -280,15 +263,13 @@ for line in sys.stdin:
         let hub = Arc::new(Hub::new(cfg).await.unwrap());
         let env = HashMap::new();
 
-        // Helper: drain the streaming list_tools_for path and return tools.
+        // Helper: drive the streaming list_tools path and return tool count.
         async fn list_streaming(hub: &Arc<Hub>, env: &HashMap<String, String>, sid: &str) -> usize {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<BackendProgress>(32);
             let h = hub.clone();
             let env = env.clone();
             let sid = sid.to_string();
-            let handle =
-                tokio::spawn(async move { h.list_tools_streaming(&[], &env, &sid, tx).await });
-            // Drain progress events.
+            let handle = tokio::spawn(async move { h.list_tools(&[], &env, &sid, Some(tx)).await });
             while rx.recv().await.is_some() {}
             let (tools, _errs) = handle.await.unwrap();
             tools.len()

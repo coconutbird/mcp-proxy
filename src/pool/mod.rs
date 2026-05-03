@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -34,6 +34,16 @@ pub use env_key::relevant_env_keys;
 use env_key::{
     DEFAULT_ENV_KEY, ENV_KEY_PREFIX, SESSION_KEY_PREFIX, backend_env_key, sharing_env_key,
 };
+
+/// Live handle returned by [`BackendPool::lookup_entry`]. Bundles everything a
+/// caller needs to invoke the backend and react to its health without holding
+/// the pool's read lock.
+struct BackendHandle {
+    key: BackendKey,
+    backend: Arc<TokioMutex<Backend>>,
+    health_sync: HealthSync,
+    crashed: Arc<AtomicBool>,
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -274,99 +284,16 @@ impl BackendPool {
         Ok(key)
     }
 
-    /// Ensure all requested backends exist (spawns concurrently).
-    pub(crate) async fn ensure_backends(
-        self: &Arc<Self>,
-        servers: &[String],
-        env_overrides: &HashMap<String, String>,
-        session_id: &str,
-    ) -> Vec<(String, String)> {
-        let cfg = self.raw_config.read().await;
-        let names: Vec<String> = if servers.is_empty() {
-            cfg.active_server_names()
-        } else {
-            servers.to_vec()
-        };
-        drop(cfg);
-
-        // Wrap in Arc to avoid cloning the map per-task.
-        let env = Arc::new(env_overrides.clone());
-        let mut handles = Vec::new();
-        for name in names {
-            let pool = Arc::clone(self);
-            let env = Arc::clone(&env);
-            let sid = session_id.to_string();
-            handles.push(tokio::spawn(async move {
-                if let Err(e) = pool.ensure_backend(&name, &env, &sid).await {
-                    warn!(server = %name, error = %e, "failed to ensure backend");
-                    Some((name, e.to_string()))
-                } else {
-                    None
-                }
-            }));
-        }
-
-        let mut errors = Vec::new();
-        for handle in handles {
-            if let Ok(Some(err)) = handle.await {
-                errors.push(err);
-            }
-        }
-        errors
-    }
-
-    /// Return matching backends for the given server filter.
+    /// Ensure all requested backends, then collect their tools.
     ///
-    /// Uses cached sharing mode on each entry so we only need the backends
-    /// read-lock — no config lock on the hot path.
-    pub(crate) async fn matched_backends(
-        &self,
-        servers: &[String],
-        env_overrides: &HashMap<String, String>,
-        session_id: &str,
-    ) -> Vec<(String, Arc<TokioMutex<Backend>>)> {
-        let map = self.backends.read().await;
-        let mut matched = Vec::new();
-
-        for (key, entry) in map.iter() {
-            if !servers.is_empty() && !servers.contains(&key.server) {
-                continue;
-            }
-            let expected = entry.expected_scope(env_overrides, session_id);
-            if key.scope != expected {
-                continue;
-            }
-            entry.touch();
-            matched.push((key.server.clone(), entry.backend.clone()));
-        }
-        matched
-    }
-
-    /// Collect tools from matching backends.
-    pub(crate) async fn backend_tools(
-        &self,
-        servers: &[String],
-        env_overrides: &HashMap<String, String>,
-        session_id: &str,
-    ) -> Vec<Tool> {
-        let matched = self
-            .matched_backends(servers, env_overrides, session_id)
-            .await;
-        let mut out: Vec<Tool> = Vec::new();
-        for (_name, be_arc) in &matched {
-            let be = be_arc.lock().await;
-            out.extend(be.tools.iter().cloned());
-        }
-        out
-    }
-
-    /// Ensure all backends then collect their tools with progress events.
-    pub(crate) async fn backend_tools_streaming(
+    /// If `progress` is `Some`, sends a [`BackendProgress`] event per backend
+    /// as it finishes spawning (used by HTTP for SSE). If `None`, runs silent.
+    pub(crate) async fn list_tools(
         self: &Arc<Self>,
         servers: &[String],
         env_overrides: &HashMap<String, String>,
         session_id: &str,
-        tx: mpsc::Sender<BackendProgress>,
+        progress: Option<mpsc::Sender<BackendProgress>>,
     ) -> (Vec<Tool>, Vec<(String, String)>) {
         let names: Vec<String> = {
             let cfg = self.raw_config.read().await;
@@ -383,50 +310,96 @@ impl BackendPool {
             let pool = Arc::clone(self);
             let env = Arc::clone(&env);
             let sid = session_id.to_string();
-            let progress_tx = tx.clone();
+            let progress = progress.clone();
             handles.push(tokio::spawn(async move {
                 match pool.ensure_backend(&name, &env, &sid).await {
                     Ok(key) => {
-                        let tool_count = {
-                            let map = pool.backends.read().await;
-                            match map.get(&key) {
-                                Some(e) => e.tool_count.load(Ordering::Acquire) as usize,
-                                None => 0,
-                            }
-                        };
-                        let _ = progress_tx
-                            .send(BackendProgress::Ready {
-                                server: name.clone(),
-                                tools: tool_count,
-                            })
-                            .await;
-                        Ok((name, key))
+                        if let Some(tx) = &progress {
+                            let tools = {
+                                let map = pool.backends.read().await;
+                                map.get(&key)
+                                    .map(|e| e.tool_count.load(Ordering::Acquire) as usize)
+                                    .unwrap_or(0)
+                            };
+                            let _ = tx
+                                .send(BackendProgress::Ready {
+                                    server: name.clone(),
+                                    tools,
+                                })
+                                .await;
+                        }
+                        Ok(())
                     }
                     Err(e) => {
                         warn!(server = %name, error = %e, "failed to ensure backend");
                         let msg = e.to_string();
-                        let _ = progress_tx
-                            .send(BackendProgress::Failed {
-                                server: name.clone(),
-                                error: msg.clone(),
-                            })
-                            .await;
+                        if let Some(tx) = &progress {
+                            let _ = tx
+                                .send(BackendProgress::Failed {
+                                    server: name.clone(),
+                                    error: msg.clone(),
+                                })
+                                .await;
+                        }
                         Err((name, msg))
                     }
                 }
             }));
         }
-        drop(tx);
+        drop(progress); // close channel when all tasks finish
 
         let mut errors = Vec::new();
         for handle in handles {
-            if let Ok(Err((name, msg))) = handle.await {
-                errors.push((name, msg));
+            if let Ok(Err(err)) = handle.await {
+                errors.push(err);
             }
         }
 
-        let tools = self.backend_tools(servers, env_overrides, session_id).await;
-        (tools, errors)
+        (
+            self.collect_tools(servers, env_overrides, session_id).await,
+            errors,
+        )
+    }
+
+    /// Direct map lookup: for each configured server matching the filter,
+    /// compute its scope key and read the entry's tools (if present).
+    async fn collect_tools(
+        &self,
+        servers: &[String],
+        env_overrides: &HashMap<String, String>,
+        session_id: &str,
+    ) -> Vec<Tool> {
+        let keys: Vec<BackendKey> = {
+            let cfg = self.raw_config.read().await;
+            cfg.servers
+                .iter()
+                .filter(|(name, srv)| {
+                    (servers.is_empty() || servers.contains(name)) && !is_server_disabled(name, srv)
+                })
+                .map(|(name, srv)| BackendKey {
+                    server: name.clone(),
+                    scope: sharing_env_key(srv, env_overrides, session_id),
+                })
+                .collect()
+        };
+
+        let backends: Vec<Arc<TokioMutex<Backend>>> = {
+            let map = self.backends.read().await;
+            keys.iter()
+                .filter_map(|k| {
+                    let entry = map.get(k)?;
+                    entry.touch();
+                    Some(entry.backend.clone())
+                })
+                .collect()
+        };
+
+        let mut out = Vec::new();
+        for be_arc in backends {
+            let be = be_arc.lock().await;
+            out.extend(be.tools.iter().cloned());
+        }
+        out
     }
 
     /// Route a tool call to the correct backend. If the backend was reaped
@@ -446,32 +419,33 @@ impl BackendPool {
         env_overrides: &HashMap<String, String>,
         session_id: &str,
     ) -> Result<Value, RpcError> {
-        let Some(server_name) = self.server_for_tool(name, servers).await else {
+        let Some((server_name, srv)) = self.server_for_tool(name, servers).await else {
             return Err(RpcError::ToolNotFound(name.to_string()));
         };
         let prefix_len = server_name.len() + 1;
         let original_name = name[prefix_len..].to_string();
+        let scope = sharing_env_key(&srv, env_overrides, session_id);
 
         // First attempt: hit the existing entry if present.
-        if let Some((key, be_arc, health_sync)) = self
-            .lookup_entry(&server_name, env_overrides, session_id)
-            .await
-        {
-            let result =
-                Self::invoke(be_arc.clone(), &original_name, args.clone(), &health_sync).await;
-            // If the call succeeded or the backend is still alive (transient
-            // error), return as-is. Only evict when the underlying process is
-            // dead AND auto-restart has given up — otherwise we'd starve a
-            // backend that's mid-restart.
-            if result.is_ok() || !be_arc.lock().await.has_crashed() {
+        if let Some(h) = self.lookup_entry(&server_name, &scope).await {
+            let result = Self::invoke(
+                h.backend.clone(),
+                &original_name,
+                args.clone(),
+                &h.health_sync,
+            )
+            .await;
+            // Return on success, or when the backend is still alive (transient
+            // error). Only evict when the process is dead AND auto-restart has
+            // given up — otherwise we'd starve a backend that's mid-restart.
+            if result.is_ok() || !h.crashed.load(Ordering::Acquire) {
                 return result;
             }
-            warn!(server = %server_name, scope = %key.scope, "evicting dead backend after failed call");
-            self.remove_and_kill(&[key]).await;
+            warn!(server = %server_name, scope = %h.key.scope, "evicting dead backend after failed call");
+            self.remove_and_kill(&[h.key]).await;
             // Fall through to spawn-and-retry.
         }
 
-        // Miss (or just-evicted): spawn now and retry.
         info!(server = %server_name, tool = %name, "spawning backend for tool call");
         self.ensure_backend(&server_name, env_overrides, session_id)
             .await
@@ -479,47 +453,40 @@ impl BackendPool {
                 RpcError::Internal(format!("failed to spawn backend '{server_name}': {e}"))
             })?;
 
-        match self
-            .lookup_entry(&server_name, env_overrides, session_id)
-            .await
-        {
-            Some((_key, be_arc, health_sync)) => {
-                Self::invoke(be_arc, &original_name, args, &health_sync).await
-            }
+        match self.lookup_entry(&server_name, &scope).await {
+            Some(h) => Self::invoke(h.backend, &original_name, args, &h.health_sync).await,
             None => Err(RpcError::ToolNotFound(name.to_string())),
         }
     }
 
-    /// Look up the live entry for a given (server, scope), touching its idle
-    /// timer. Returns the backend key + handle + health-atomics handle on hit.
-    async fn lookup_entry(
-        &self,
-        server_name: &str,
-        env_overrides: &HashMap<String, String>,
-        session_id: &str,
-    ) -> Option<(BackendKey, Arc<TokioMutex<Backend>>, HealthSync)> {
+    /// Direct hashmap lookup keyed by `(server, scope)`. Touches the entry's
+    /// idle timer on hit.
+    async fn lookup_entry(&self, server_name: &str, scope: &str) -> Option<BackendHandle> {
+        let key = BackendKey {
+            server: server_name.to_string(),
+            scope: scope.to_string(),
+        };
         let map = self.backends.read().await;
-        for (key, entry) in map.iter() {
-            if key.server != server_name {
-                continue;
-            }
-            let expected = entry.expected_scope(env_overrides, session_id);
-            if key.scope != expected {
-                continue;
-            }
-            entry.touch();
-            return Some((key.clone(), entry.backend.clone(), entry.health_sync()));
-        }
-        None
+        let entry = map.get(&key)?;
+        entry.touch();
+        Some(BackendHandle {
+            key,
+            backend: entry.backend.clone(),
+            health_sync: entry.health_sync(),
+            crashed: entry.crashed.clone(),
+        })
     }
 
     /// Find the configured server whose `{name}_` prefix matches the tool,
-    /// preferring the longest match. Honors the `servers` filter and skips
-    /// disabled servers. Uses config (not the live map) so reaped servers
-    /// still resolve correctly.
-    async fn server_for_tool(&self, name: &str, servers: &[String]) -> Option<String> {
+    /// preferring the longest match. Returns the server's config too so the
+    /// caller can compute the scope key without re-locking.
+    async fn server_for_tool(
+        &self,
+        name: &str,
+        servers: &[String],
+    ) -> Option<(String, ServerConfig)> {
         let cfg = self.raw_config.read().await;
-        let mut best: Option<(usize, String)> = None;
+        let mut best: Option<(usize, String, ServerConfig)> = None;
         for (srv_name, srv) in &cfg.servers {
             if !servers.is_empty() && !servers.contains(srv_name) {
                 continue;
@@ -531,12 +498,12 @@ impl BackendPool {
             if name.len() > prefix_len
                 && name.starts_with(srv_name.as_str())
                 && name.as_bytes()[srv_name.len()] == b'_'
-                && best.as_ref().is_none_or(|(l, _)| prefix_len > *l)
+                && best.as_ref().is_none_or(|(l, _, _)| prefix_len > *l)
             {
-                best = Some((prefix_len, srv_name.clone()));
+                best = Some((prefix_len, srv_name.clone(), srv.clone()));
             }
         }
-        best.map(|(_, n)| n)
+        best.map(|(_, n, s)| (n, s))
     }
 
     async fn invoke(
