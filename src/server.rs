@@ -253,6 +253,226 @@ for line in sys.stdin:
         }
     }
 
+    fn mock_config_with_idle(script: &std::path::Path, idle_secs: u64) -> Config {
+        let srv = ServerConfig {
+            command: "python3".into(),
+            args: vec![script.display().to_string()],
+            shared: Sharing::Session,
+            idle_timeout_secs: Some(idle_secs),
+            ..Default::default()
+        };
+        let mut servers = HashMap::new();
+        servers.insert("fake".to_string(), srv);
+        Config {
+            servers,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_streaming_after_reap_respawns_for_same_session() {
+        if !have_python3() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let script = write_mock_script("list_streaming_after_reap");
+        let cfg = mock_config_with_idle(&script, 1);
+        let hub = Arc::new(Hub::new(cfg).await.unwrap());
+        let env = HashMap::new();
+
+        // Helper: drain the streaming list_tools_for path and return tools.
+        async fn list_streaming(hub: &Arc<Hub>, env: &HashMap<String, String>, sid: &str) -> usize {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<BackendProgress>(32);
+            let h = hub.clone();
+            let env = env.clone();
+            let sid = sid.to_string();
+            let handle =
+                tokio::spawn(async move { h.list_tools_streaming(&[], &env, &sid, tx).await });
+            // Drain progress events.
+            while rx.recv().await.is_some() {}
+            let (tools, _errs) = handle.await.unwrap();
+            tools.len()
+        }
+
+        assert_eq!(list_streaming(&hub, &env, "sess-a").await, 1);
+        assert_eq!(hub.health().await["backends"].as_array().unwrap().len(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        hub.pool.reap_once().await;
+        assert_eq!(hub.health().await["backends"].as_array().unwrap().len(), 0);
+
+        assert_eq!(
+            list_streaming(&hub, &env, "sess-a").await,
+            1,
+            "streaming list on same session must respawn reaped backend"
+        );
+
+        hub.shutdown().await;
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
+    /// Reproduction for the user's complaint: "session has tools, some get
+    /// reaped, the reaped tools don't come back for that session but DO start
+    /// for new sessions." Explores the crash path (process exits unexpectedly)
+    /// rather than the idle-reap path.
+    #[tokio::test]
+    async fn crashed_backend_recovers_for_same_session() {
+        if !have_python3() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // Mock that exits after ONE tool call. Session-scoped, max_restarts=0
+        // so try_restart fails immediately, forcing the "stays in map crashed"
+        // failure mode.
+        let one_shot = r#"
+import json, os, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: req = json.loads(line)
+    except Exception: continue
+    if "id" not in req: continue
+    m = req.get("method", "")
+    if m == "initialize":
+        r = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0"}}
+    elif m == "tools/list":
+        r = {"tools":[{"name":"ping","description":"","inputSchema":{"type":"object"}}]}
+    elif m == "tools/call":
+        sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":{"pid":os.getpid()}})+"\n")
+        sys.stdout.flush()
+        sys.exit(0)  # die after responding
+    else:
+        continue
+    sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":r})+"\n")
+    sys.stdout.flush()
+"#;
+        let tmp = std::env::temp_dir().join(format!("mcp_crash_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let script = tmp.join("oneshot.py");
+        std::fs::write(&script, one_shot).unwrap();
+
+        let srv = ServerConfig {
+            command: "python3".into(),
+            args: vec![script.display().to_string()],
+            shared: Sharing::Session,
+            auto_restart: true,
+            max_restarts: Some(0), // restart attempts always fail
+            ..Default::default()
+        };
+        let mut servers = HashMap::new();
+        servers.insert("fake".to_string(), srv);
+        let cfg = Config {
+            servers,
+            ..Default::default()
+        };
+        let hub = Arc::new(Hub::new(cfg).await.unwrap());
+        let env = HashMap::new();
+
+        // 1st call on session A: succeeds; the python process then exits.
+        hub.handle_request(
+            "tools/call",
+            serde_json::json!({"name": "fake_ping", "arguments": {}}),
+            &[],
+            &env,
+            "sess-a",
+        )
+        .await
+        .expect("first call should succeed");
+
+        // Give stdout-reader task time to mark crashed=true.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // 2nd call on session A: tries auto-restart, fails (max_restarts=0).
+        // Currently the dead entry stays in the map — so session A is stuck.
+        let _ = hub
+            .handle_request(
+                "tools/call",
+                serde_json::json!({"name": "fake_ping", "arguments": {}}),
+                &[],
+                &env,
+                "sess-a",
+            )
+            .await;
+
+        // Now verify the bug: a NEW session spawns a fresh backend (works),
+        // but session A's next attempt should ALSO get a fresh process.
+        let new_sess_result = hub
+            .handle_request(
+                "tools/call",
+                serde_json::json!({"name": "fake_ping", "arguments": {}}),
+                &[],
+                &env,
+                "sess-b",
+            )
+            .await;
+        assert!(
+            new_sess_result.is_ok(),
+            "new session should spawn fresh backend: {new_sess_result:?}"
+        );
+
+        let same_sess_result = hub
+            .handle_request(
+                "tools/call",
+                serde_json::json!({"name": "fake_ping", "arguments": {}}),
+                &[],
+                &env,
+                "sess-a",
+            )
+            .await;
+        assert!(
+            same_sess_result.is_ok(),
+            "ORIGINAL session should also recover with a fresh backend: {same_sess_result:?}"
+        );
+
+        hub.shutdown().await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Reproduction for: "session has tools, some get reaped, the reaped tools
+    /// don't come back for that session but do start for new sessions."
+    #[tokio::test]
+    async fn tools_list_after_reap_respawns_for_same_session() {
+        if !have_python3() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let script = write_mock_script("list_after_reap");
+        let cfg = mock_config_with_idle(&script, 1);
+        let hub = Arc::new(Hub::new(cfg).await.unwrap());
+        let env = HashMap::new();
+
+        // Session A: first tools/list spawns the backend.
+        let list = hub
+            .handle_request("tools/list", Value::Null, &[], &env, "sess-a")
+            .await
+            .unwrap();
+        assert_eq!(list["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(hub.health().await["backends"].as_array().unwrap().len(), 1);
+
+        // Wait past the 1s idle timeout, then drive the reaper.
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        hub.pool.reap_once().await;
+        assert_eq!(
+            hub.health().await["backends"].as_array().unwrap().len(),
+            0,
+            "backend should have been reaped"
+        );
+
+        // Same session: tools/list MUST bring the backend back.
+        let list = hub
+            .handle_request("tools/list", Value::Null, &[], &env, "sess-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            list["tools"].as_array().unwrap().len(),
+            1,
+            "same session should see tools again after reap: {list}"
+        );
+
+        hub.shutdown().await;
+        let _ = std::fs::remove_dir_all(script.parent().unwrap());
+    }
+
     async fn empty_hub() -> Arc<Hub> {
         Arc::new(Hub::new(Config::default()).await.unwrap())
     }

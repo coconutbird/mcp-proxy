@@ -431,6 +431,9 @@ impl BackendPool {
 
     /// Route a tool call to the correct backend. If the backend was reaped
     /// for idleness, respawn it on demand before returning `ToolNotFound`.
+    /// If the existing entry's process has died and exhausted its restart
+    /// budget, evict it and respawn so the same session isn't permanently
+    /// stuck on a dead process.
     ///
     /// Owner resolution goes through config (not the live map), so a tool that
     /// belongs to a reaped server can't be accidentally claimed by a sibling
@@ -449,14 +452,26 @@ impl BackendPool {
         let prefix_len = server_name.len() + 1;
         let original_name = name[prefix_len..].to_string();
 
-        if let Some((be_arc, health_sync)) = self
+        // First attempt: hit the existing entry if present.
+        if let Some((key, be_arc, health_sync)) = self
             .lookup_entry(&server_name, env_overrides, session_id)
             .await
         {
-            return Self::invoke(be_arc, &original_name, args, &health_sync).await;
+            let result =
+                Self::invoke(be_arc.clone(), &original_name, args.clone(), &health_sync).await;
+            // If the call succeeded or the backend is still alive (transient
+            // error), return as-is. Only evict when the underlying process is
+            // dead AND auto-restart has given up — otherwise we'd starve a
+            // backend that's mid-restart.
+            if result.is_ok() || !be_arc.lock().await.has_crashed() {
+                return result;
+            }
+            warn!(server = %server_name, scope = %key.scope, "evicting dead backend after failed call");
+            self.remove_and_kill(&[key]).await;
+            // Fall through to spawn-and-retry.
         }
 
-        // Miss: backend was reaped (or never spawned). Spawn now and retry.
+        // Miss (or just-evicted): spawn now and retry.
         info!(server = %server_name, tool = %name, "spawning backend for tool call");
         self.ensure_backend(&server_name, env_overrides, session_id)
             .await
@@ -468,7 +483,7 @@ impl BackendPool {
             .lookup_entry(&server_name, env_overrides, session_id)
             .await
         {
-            Some((be_arc, health_sync)) => {
+            Some((_key, be_arc, health_sync)) => {
                 Self::invoke(be_arc, &original_name, args, &health_sync).await
             }
             None => Err(RpcError::ToolNotFound(name.to_string())),
@@ -476,13 +491,13 @@ impl BackendPool {
     }
 
     /// Look up the live entry for a given (server, scope), touching its idle
-    /// timer. Returns the backend handle + health-atomics handle on hit.
+    /// timer. Returns the backend key + handle + health-atomics handle on hit.
     async fn lookup_entry(
         &self,
         server_name: &str,
         env_overrides: &HashMap<String, String>,
         session_id: &str,
-    ) -> Option<(Arc<TokioMutex<Backend>>, HealthSync)> {
+    ) -> Option<(BackendKey, Arc<TokioMutex<Backend>>, HealthSync)> {
         let map = self.backends.read().await;
         for (key, entry) in map.iter() {
             if key.server != server_name {
@@ -493,7 +508,7 @@ impl BackendPool {
                 continue;
             }
             entry.touch();
-            return Some((entry.backend.clone(), entry.health_sync()));
+            return Some((key.clone(), entry.backend.clone(), entry.health_sync()));
         }
         None
     }
